@@ -11,6 +11,7 @@ use crate::emitter::Emitter;
 use crate::error::{Result, XLuauError};
 use crate::formatter::Formatter;
 use crate::lexer::Lexer;
+use crate::lowering::Lowerer;
 use crate::parser::Parser;
 use crate::source::{SourceFile, SourceKind};
 
@@ -102,12 +103,30 @@ impl Compiler {
                 continue;
             }
 
-            let emitted = Emitter::new().emit(&program);
+            let lowered_text = Lowerer::new().lower_program(&source, &program, &mut diagnostics);
+
+            if diagnostics.iter().any(Diagnostic::is_error) {
+                all_diagnostics.extend(diagnostics);
+                continue;
+            }
+
+            let lowered_source =
+                SourceFile::virtual_file(source.path.clone(), SourceKind::Luau, lowered_text);
+            let lowered_tokens = Lexer::new(&lowered_source).lex(&mut diagnostics);
+            let lowered_program =
+                Parser::new(&lowered_source, &lowered_tokens).parse(&mut diagnostics);
+
+            if diagnostics.iter().any(Diagnostic::is_error) {
+                all_diagnostics.extend(diagnostics);
+                continue;
+            }
+
+            let emitted = Emitter::new().emit(&lowered_program);
             let output = Formatter::default().format(&emitted.text);
 
             compiled.push(CompiledFile {
                 source,
-                _program: program,
+                _program: lowered_program,
                 output,
             });
 

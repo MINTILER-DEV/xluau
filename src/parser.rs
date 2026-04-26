@@ -22,6 +22,7 @@ impl<'a> Parser<'a> {
         let mut paren_depth = 0usize;
         let mut brace_depth = 0usize;
         let mut bracket_depth = 0usize;
+        let mut block_depth = 0usize;
 
         for (index, token) in self.tokens.iter().enumerate() {
             match token.kind {
@@ -37,10 +38,24 @@ impl<'a> Parser<'a> {
                 TokenKind::Symbol(Symbol::RightBracket) => {
                     bracket_depth = bracket_depth.saturating_sub(1);
                 }
+                TokenKind::Keyword(keyword) => match keyword {
+                    Keyword::Function
+                    | Keyword::If
+                    | Keyword::For
+                    | Keyword::While
+                    | Keyword::Do
+                    | Keyword::Repeat
+                    | Keyword::Switch => block_depth += 1,
+                    Keyword::End | Keyword::Until => {
+                        block_depth = block_depth.saturating_sub(1);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
 
-            let at_top_level = paren_depth == 0 && brace_depth == 0 && bracket_depth == 0;
+            let at_top_level =
+                paren_depth == 0 && brace_depth == 0 && bracket_depth == 0 && block_depth == 0;
             let is_boundary = at_top_level
                 && matches!(
                     token.kind,
@@ -170,7 +185,8 @@ fn classify_statement(tokens: &[Token]) -> StatementKind {
         TokenKind::Keyword(Keyword::Class)
         | TokenKind::Keyword(Keyword::Const)
         | TokenKind::Keyword(Keyword::Enum)
-        | TokenKind::Keyword(Keyword::Macro) => StatementKind::XLuauDeclaration,
+        | TokenKind::Keyword(Keyword::Macro)
+        | TokenKind::Keyword(Keyword::Switch) => StatementKind::XLuauDeclaration,
         TokenKind::Symbol(Symbol::At) => StatementKind::XLuauDeclaration,
         _ if significant.iter().any(has_extension_token) => StatementKind::XLuauExpression,
         _ => StatementKind::Luau,
@@ -249,5 +265,20 @@ mod tests {
 
         assert_eq!(program.statements[0].kind, StatementKind::ImportDeclaration);
         assert_eq!(program.statements[1].kind, StatementKind::XLuauExpression);
+    }
+
+    #[test]
+    fn parser_keeps_function_block_as_single_statement() {
+        let source = SourceFile {
+            path: PathBuf::from("test.xl"),
+            kind: SourceKind::XLuau,
+            text: "function demo()\n    local value = 1\n    return value\nend\nprint(demo())"
+                .to_owned(),
+        };
+        let tokens = Lexer::new(&source).lex(&mut Vec::new());
+        let program = Parser::new(&source, &tokens).parse(&mut Vec::new());
+
+        assert_eq!(program.statements.len(), 2);
+        assert!(program.statements[0].raw_text.contains("return value"));
     }
 }

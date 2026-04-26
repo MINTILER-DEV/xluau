@@ -6,6 +6,7 @@ mod emitter;
 mod error;
 mod formatter;
 mod lexer;
+mod lowering;
 mod parser;
 mod source;
 

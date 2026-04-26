@@ -23,6 +23,10 @@ impl SourceFile {
         let text = fs::read_to_string(&path)?;
         Ok(Self { path, kind, text })
     }
+
+    pub fn virtual_file(path: PathBuf, kind: SourceKind, text: String) -> Self {
+        Self { path, kind, text }
+    }
 }
 
 impl SourceKind {
