@@ -14,6 +14,7 @@ use crate::lexer::Lexer;
 use crate::lowering::Lowerer;
 use crate::parser::Parser;
 use crate::phase4::PhaseFourTransformer;
+use crate::phase5::PhaseFiveTransformer;
 use crate::resolver::Resolver;
 use crate::source::{SourceFile, SourceKind};
 
@@ -114,7 +115,12 @@ impl Compiler {
                     .map(|diagnostic| (diagnostic, source.text.clone())),
             );
 
-            let lowered_text = Lowerer::new().lower_program(&source, &program, &mut diagnostics);
+            let phase_five_text =
+                PhaseFiveTransformer::new(self.config.clone()).transform_program(
+                    &source,
+                    &program,
+                    &mut diagnostics,
+                );
 
             if diagnostics.iter().any(Diagnostic::is_error) {
                 all_diagnostics.extend(diagnostics);
@@ -124,6 +130,28 @@ impl Compiler {
                 diagnostics
                     .drain(..)
                     .map(|diagnostic| (diagnostic, source.text.clone())),
+            );
+
+            let phase_five_source = SourceFile::virtual_file(
+                source.path.clone(),
+                SourceKind::XLuau,
+                phase_five_text,
+            );
+            let phase_five_tokens = Lexer::new(&phase_five_source).lex(&mut diagnostics);
+            let phase_five_program =
+                Parser::new(&phase_five_source, &phase_five_tokens).parse(&mut diagnostics);
+
+            let lowered_text =
+                Lowerer::new().lower_program(&phase_five_source, &phase_five_program, &mut diagnostics);
+
+            if diagnostics.iter().any(Diagnostic::is_error) {
+                all_diagnostics.extend(diagnostics);
+                continue;
+            }
+            warning_diagnostics.extend(
+                diagnostics
+                    .drain(..)
+                    .map(|diagnostic| (diagnostic, phase_five_source.text.clone())),
             );
 
             let lowered_source =

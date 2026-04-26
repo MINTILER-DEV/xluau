@@ -9,6 +9,7 @@ mod lexer;
 mod lowering;
 mod parser;
 mod phase4;
+mod phase5;
 mod resolver;
 mod source;
 
