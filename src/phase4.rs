@@ -64,6 +64,7 @@ struct ObjectField {
 struct EnumMember {
     name: String,
     value: String,
+    explicit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1171,12 +1172,13 @@ fn parse_enum_definition(text: &str) -> Option<EnumDefinition> {
             .trim()
             .to_owned();
         if !raw.is_empty() {
-            let (member_name, value) = split_top_level_once(raw.as_str(), '=')
-                .map(|(left, right)| (left.trim().to_owned(), right.trim().to_owned()))
-                .unwrap_or((raw.clone(), format!("\"{}\"", raw.trim())));
+            let (member_name, value, explicit) = split_top_level_once(raw.as_str(), '=')
+                .map(|(left, right)| (left.trim().to_owned(), right.trim().to_owned(), true))
+                .unwrap_or((raw.clone(), format!("\"{}\"", raw.trim()), false));
             members.push(EnumMember {
                 name: member_name,
                 value,
+                explicit,
             });
         }
         cursor = end + 1;
@@ -1203,7 +1205,7 @@ fn enum_union_type(definition: &EnumDefinition) -> String {
             .members
             .iter()
             .map(|member| {
-                if definition.backing.is_some() {
+                if definition.backing.is_some() || member.explicit {
                     member.value.clone()
                 } else {
                     format!("\"{}\"", member.name)
@@ -1782,6 +1784,14 @@ mod tests {
         assert!(output.contains("type Direction = \"North\" | \"South\""));
         assert!(output.contains("local Direction = {"));
         assert!(output.contains("table.freeze(Direction)"));
+    }
+
+    #[test]
+    fn transforms_enum_with_explicit_values() {
+        let output = transform("enum State { Ready = \"ready\", Waiting = \"waiting\" }\n");
+        assert!(output.contains("type State = \"ready\" | \"waiting\""));
+        assert!(output.contains("Ready = \"ready\" :: State"));
+        assert!(output.contains("Waiting = \"waiting\" :: State"));
     }
 
     #[test]

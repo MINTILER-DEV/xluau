@@ -2078,6 +2078,13 @@ impl ExprParser {
         };
 
         match token.kind {
+            TokenKind::Identifier if token.lexeme == "freeze" => {
+                if let Some(braced) = self.consume_braced_literal_text() {
+                    Expr::Raw(format!("freeze {}", braced))
+                } else {
+                    self.parse_postfix(Expr::Name(token.lexeme))
+                }
+            }
             TokenKind::Identifier => self.parse_postfix(Expr::Name(token.lexeme)),
             TokenKind::Number
             | TokenKind::String
@@ -2293,6 +2300,37 @@ impl ExprParser {
         }
     }
 
+    fn consume_braced_literal_text(&mut self) -> Option<String> {
+        if !self.peek_kind(TokenKind::Symbol(Symbol::LeftBrace)) {
+            return None;
+        }
+
+        let start = self.cursor;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, token) in self.tokens.iter().enumerate().skip(start) {
+            match token.kind {
+                TokenKind::Symbol(Symbol::LeftBrace) => depth += 1,
+                TokenKind::Symbol(Symbol::RightBrace) => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let end = end?;
+        let text = self.tokens[start..=end]
+            .iter()
+            .map(|token| token.lexeme.as_str())
+            .collect::<String>();
+        self.cursor = end + 1;
+        Some(text)
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.cursor)
     }
@@ -2491,6 +2529,7 @@ fn split_top_level_once(text: &str, separator: char) -> Option<(String, String)>
     let mut paren = 0usize;
     let mut brace = 0usize;
     let mut bracket = 0usize;
+    let mut angle = 0usize;
 
     for (index, ch) in text.char_indices() {
         match ch {
@@ -2500,10 +2539,12 @@ fn split_top_level_once(text: &str, separator: char) -> Option<(String, String)>
             '}' => brace = brace.saturating_sub(1),
             '[' => bracket += 1,
             ']' => bracket = bracket.saturating_sub(1),
+            '<' => angle += 1,
+            '>' => angle = angle.saturating_sub(1),
             _ => {}
         }
 
-        if ch == separator && paren == 0 && brace == 0 && bracket == 0 {
+        if ch == separator && paren == 0 && brace == 0 && bracket == 0 && angle == 0 {
             return Some((
                 text[..index].to_owned(),
                 text[index + ch.len_utf8()..].to_owned(),
@@ -2585,6 +2626,7 @@ fn split_top_level(text: &str, separator: char) -> Vec<String> {
     let mut paren = 0usize;
     let mut brace = 0usize;
     let mut bracket = 0usize;
+    let mut angle = 0usize;
 
     for ch in text.chars() {
         match ch {
@@ -2594,10 +2636,12 @@ fn split_top_level(text: &str, separator: char) -> Vec<String> {
             '}' => brace = brace.saturating_sub(1),
             '[' => bracket += 1,
             ']' => bracket = bracket.saturating_sub(1),
+            '<' => angle += 1,
+            '>' => angle = angle.saturating_sub(1),
             _ => {}
         }
 
-        if ch == separator && paren == 0 && brace == 0 && bracket == 0 {
+        if ch == separator && paren == 0 && brace == 0 && bracket == 0 && angle == 0 {
             parts.push(current.trim().to_owned());
             current.clear();
         } else {
@@ -2749,5 +2793,21 @@ mod tests {
         assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
         assert!(lowered.contains("function wrap<T extends string, U = {T}>"));
         assert!(lowered.contains("local boxed = wrap<number?>(nil)"));
+    }
+
+    #[test]
+    fn preserves_freeze_and_multi_type_args_for_phase_four() {
+        let (lowered, diagnostics) = lower(
+            "const defaults = freeze { host = \"localhost\", retries = 3 }\nlocal pinned = wrap<string, string>(\"typed\")\n",
+        );
+
+        assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
+        assert!(lowered.contains("local defaults = freeze {"));
+        assert!(lowered.contains("\"localhost\""));
+        assert!(lowered.contains("retries"));
+        assert!(
+            lowered.contains("local pinned = wrap<string, string>(\"typed\")")
+                || lowered.contains("local pinned = wrap<string,string>(\"typed\")")
+        );
     }
 }
