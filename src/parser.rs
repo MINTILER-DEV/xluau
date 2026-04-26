@@ -54,18 +54,22 @@ impl<'a> Parser<'a> {
                 TokenKind::Symbol(Symbol::RightBracket) => {
                     bracket_depth = bracket_depth.saturating_sub(1);
                 }
-                TokenKind::Keyword(keyword) => match keyword {
-                    Keyword::Function
-                    | Keyword::If
-                    | Keyword::For
-                    | Keyword::While
-                    | Keyword::Repeat
-                    | Keyword::Switch => block_depth += 1,
-                    Keyword::End | Keyword::Until => {
-                        block_depth = block_depth.saturating_sub(1);
+                TokenKind::Keyword(keyword)
+                    if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 =>
+                {
+                    match keyword {
+                        Keyword::Function
+                        | Keyword::If
+                        | Keyword::For
+                        | Keyword::While
+                        | Keyword::Repeat
+                        | Keyword::Switch => block_depth += 1,
+                        Keyword::End | Keyword::Until => {
+                            block_depth = block_depth.saturating_sub(1);
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
 
@@ -856,7 +860,9 @@ fn classify_statement(tokens: &[Token]) -> StatementKind {
         TokenKind::Keyword(Keyword::Import) => StatementKind::ImportDeclaration,
         TokenKind::Keyword(Keyword::Export) => StatementKind::ExportDeclaration,
         TokenKind::Keyword(Keyword::Type) => StatementKind::TypeDeclaration,
+        TokenKind::Keyword(Keyword::Abstract) if significant.get(1).map(|token| token.kind.clone()) == Some(TokenKind::Keyword(Keyword::Class)) => StatementKind::XLuauDeclaration,
         TokenKind::Keyword(Keyword::Class)
+        | TokenKind::Keyword(Keyword::Interface)
         | TokenKind::Keyword(Keyword::Const)
         | TokenKind::Keyword(Keyword::Enum)
         | TokenKind::Keyword(Keyword::Let)
@@ -1364,5 +1370,22 @@ mod tests {
             },
             other => panic!("expected export node, found {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_separates_interface_and_abstract_class_blocks() {
+        let source = SourceFile {
+            path: PathBuf::from("test.xl"),
+            kind: SourceKind::XLuau,
+            text: "interface Serializable {\n    serialize: (self: Serializable) -> string\n}\nabstract class Base {\n    abstract function serialize(): string\n}\nclass Broken extends Base {\n    function mutate()\n        return nil\n    end\n}\n"
+                .to_owned(),
+        };
+        let tokens = Lexer::new(&source).lex(&mut Vec::new());
+        let program = Parser::new(&source, &tokens).parse(&mut Vec::new());
+
+        assert_eq!(program.statements.len(), 3);
+        assert!(matches!(program.statements[0].node, StatementNode::Text(_)));
+        assert!(matches!(program.statements[1].node, StatementNode::Text(_)));
+        assert!(matches!(program.statements[2].node, StatementNode::Text(_)));
     }
 }

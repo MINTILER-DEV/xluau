@@ -1126,6 +1126,10 @@ impl Lowerer {
     }
 
     fn lower_expression(&mut self, text: &str) -> String {
+        if !has_expression_extensions(text) {
+            return text.to_owned();
+        }
+
         let fragment = Fragment::new(PathBuf::from("<expr>"), text);
         let tokens = fragment
             .tokens
@@ -2664,6 +2668,45 @@ fn indent_block(text: &str, prefix: &str) -> String {
     text.lines()
         .map(|line| format!("{prefix}{line}\n"))
         .collect::<String>()
+}
+
+fn has_expression_extensions(text: &str) -> bool {
+    let source =
+        SourceFile::virtual_file(PathBuf::from("<expr>"), SourceKind::XLuau, text.to_owned());
+    let tokens = Lexer::new(&source).lex(&mut Vec::new());
+    let mut paren = 0usize;
+    let mut brace = 0usize;
+    let mut bracket = 0usize;
+    let mut angle = 0usize;
+
+    for token in tokens
+        .into_iter()
+        .filter(|token| !token.is_trivia() && token.kind != TokenKind::Eof)
+    {
+        match token.kind {
+            TokenKind::Symbol(Symbol::LeftParen) => paren += 1,
+            TokenKind::Symbol(Symbol::RightParen) => paren = paren.saturating_sub(1),
+            TokenKind::Symbol(Symbol::LeftBrace) => brace += 1,
+            TokenKind::Symbol(Symbol::RightBrace) => brace = brace.saturating_sub(1),
+            TokenKind::Symbol(Symbol::LeftBracket) => bracket += 1,
+            TokenKind::Symbol(Symbol::RightBracket) => bracket = bracket.saturating_sub(1),
+            TokenKind::Symbol(Symbol::Less) => angle += 1,
+            TokenKind::Symbol(Symbol::Greater) => angle = angle.saturating_sub(1),
+            TokenKind::Symbol(Symbol::QuestionDot)
+            | TokenKind::Symbol(Symbol::QuestionQuestion)
+            | TokenKind::Symbol(Symbol::QuestionQuestionEqual)
+            | TokenKind::Symbol(Symbol::PipeGreater)
+            | TokenKind::Symbol(Symbol::FatArrow) => return true,
+            TokenKind::Symbol(Symbol::Question)
+                if paren == 0 && brace == 0 && bracket == 0 && angle == 0 =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]

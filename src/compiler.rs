@@ -487,4 +487,25 @@ mod tests {
         let output = fs::read_to_string(temp.path().join("out/server/Game.luau")).expect("output");
         assert!(output.contains("require(script.Parent.players.PlayerManager)"));
     }
+
+    #[test]
+    fn build_emits_phase_five_classes_and_decorators() {
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src")).expect("src dir");
+        fs::write(
+            temp.path().join("src/main.xl"),
+            "interface Serializable {\n    serialize: (self: Serializable) -> string\n}\n\nabstract class Animal implements Serializable {\n    @readonly\n    name: string\n\n    constructor(name: string)\n        self.name = name\n    end\n\n    abstract function serialize(): string\n}\n\n@singleton\nclass Dog extends Animal {\n    breed: string\n\n    constructor(name: string, breed: string)\n        super(name)\n        self.breed = breed\n    end\n\n    @memoize\n    function serialize(): string\n        return self.name .. \":\" .. self.breed\n    end\n}\n\nlocal pet = Dog.new(\"Fido\", \"Collie\")\nprint(pet:serialize())\n",
+        )
+        .expect("phase five source");
+
+        let compiler =
+            Compiler::new(temp.path().to_path_buf(), XLuauConfig::default()).expect("compiler");
+        compiler.build(&[]).expect("build");
+
+        let output = fs::read_to_string(temp.path().join("out/main.luau")).expect("output");
+        assert!(output.contains("type Dog = Animal & {"));
+        assert!(output.contains("local _Dog_singleton: Dog? = nil"));
+        assert!(output.contains("local _Dog_serialize_cache = {}"));
+        assert!(output.contains("function Dog.new(name: string, breed: string): Dog"));
+    }
 }

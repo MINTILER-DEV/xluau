@@ -27,6 +27,7 @@ pub enum TokenKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
+    Abstract,
     And,
     Break,
     Case,
@@ -40,12 +41,15 @@ pub enum Keyword {
     End,
     Enum,
     Export,
+    Extends,
     False,
     For,
     Function,
     If,
+    Implements,
     Import,
     In,
+    Interface,
     Let,
     Local,
     Macro,
@@ -55,6 +59,8 @@ pub enum Keyword {
     Fallthrough,
     Repeat,
     Return,
+    Static,
+    Super,
     Switch,
     Then,
     True,
@@ -469,6 +475,7 @@ impl Token {
 
 fn keyword_for(lexeme: &str) -> Option<Keyword> {
     Some(match lexeme {
+        "abstract" => Keyword::Abstract,
         "and" => Keyword::And,
         "break" => Keyword::Break,
         "case" => Keyword::Case,
@@ -482,13 +489,16 @@ fn keyword_for(lexeme: &str) -> Option<Keyword> {
         "end" => Keyword::End,
         "enum" => Keyword::Enum,
         "export" => Keyword::Export,
+        "extends" => Keyword::Extends,
         "false" => Keyword::False,
         "for" => Keyword::For,
         "fallthrough" => Keyword::Fallthrough,
         "function" => Keyword::Function,
         "if" => Keyword::If,
+        "implements" => Keyword::Implements,
         "import" => Keyword::Import,
         "in" => Keyword::In,
+        "interface" => Keyword::Interface,
         "let" => Keyword::Let,
         "local" => Keyword::Local,
         "macro" => Keyword::Macro,
@@ -497,6 +507,8 @@ fn keyword_for(lexeme: &str) -> Option<Keyword> {
         "or" => Keyword::Or,
         "repeat" => Keyword::Repeat,
         "return" => Keyword::Return,
+        "static" => Keyword::Static,
+        "super" => Keyword::Super,
         "switch" => Keyword::Switch,
         "then" => Keyword::Then,
         "true" => Keyword::True,
@@ -551,5 +563,22 @@ mod tests {
                 .iter()
                 .any(|token| token.kind == TokenKind::Symbol(Symbol::PipeGreater))
         );
+    }
+
+    #[test]
+    fn lexer_recognizes_phase_five_keywords() {
+        let source = SourceFile {
+            path: PathBuf::from("test.xl"),
+            kind: SourceKind::XLuau,
+            text: "abstract class Dog extends Animal implements Pet\n    static function build()\n        return super\n    end\nend"
+                .to_owned(),
+        };
+        let tokens = Lexer::new(&source).lex(&mut Vec::new());
+
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Keyword(Keyword::Abstract)));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Keyword(Keyword::Extends)));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Keyword(Keyword::Implements)));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Keyword(Keyword::Static)));
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::Keyword(Keyword::Super)));
     }
 }
