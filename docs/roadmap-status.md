@@ -11,9 +11,6 @@ title: Roadmap Status
 - Phase 2: High-Impact Syntax
 - Phase 3: Module System
 - Phase 4: Type System Extensions
-
-## In Progress
-
 - Phase 5: OOP
 
 ## Pending
