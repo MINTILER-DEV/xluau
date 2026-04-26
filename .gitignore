@@ -5,3 +5,8 @@ local
 /target
 /tests
 /out
+/site/node_modules
+/site/.docusaurus
+/site/build
+/site/.venv
+/site/dist

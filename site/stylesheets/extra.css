@@ -1,0 +1,37 @@
+:root {
+  --md-primary-fg-color: #0f766e;
+  --md-primary-fg-color--light: #14b8a6;
+  --md-primary-fg-color--dark: #115e59;
+  --md-accent-fg-color: #d97706;
+}
+
+[data-md-color-scheme="default"] {
+  --md-default-bg-color: #f7f7f2;
+  --md-default-fg-color: #17202a;
+  --md-typeset-a-color: #0f766e;
+}
+
+.md-header {
+  background:
+    linear-gradient(120deg, rgba(15, 118, 110, 0.96), rgba(17, 94, 89, 0.96)),
+    radial-gradient(circle at top right, rgba(245, 158, 11, 0.25), transparent 32%);
+}
+
+.md-tabs {
+  background-color: #134e4a;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  letter-spacing: -0.02em;
+}
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-radius: 0.85rem;
+}
+
+.md-content__inner {
+  max-width: 56rem;
+}
