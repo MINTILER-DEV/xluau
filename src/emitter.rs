@@ -148,9 +148,7 @@ impl Emitter {
             },
             StatementNode::Local(local) => {
                 let keyword = match local.keyword {
-                    LocalKeyword::Local => "local",
-                    LocalKeyword::Let => "let",
-                    LocalKeyword::Const => "const",
+                    LocalKeyword::Local | LocalKeyword::Let | LocalKeyword::Const => "local",
                 };
                 match &local.value {
                     Some(value) => format!("{keyword} {} = {}", local.bindings, value),
@@ -236,8 +234,8 @@ impl Emitter {
 #[cfg(test)]
 mod tests {
     use crate::ast::{
-        ConditionalClause, ConditionalKeyword, IfStatement, Program, ReturnStatement, Statement,
-        StatementKind, StatementNode,
+        ConditionalClause, ConditionalKeyword, IfStatement, LocalKeyword, LocalStatement, Program,
+        ReturnStatement, Statement, StatementKind, StatementNode,
     };
     use crate::diagnostic::Span;
     use crate::emitter::Emitter;
@@ -272,5 +270,38 @@ mod tests {
 
         let emitted = Emitter::new().emit(&program);
         assert_eq!(emitted.text, "if ready then\nreturn value\nend\n");
+    }
+
+    #[test]
+    fn emitter_normalizes_xluau_local_keywords_to_luau_local() {
+        let program = Program {
+            source_kind: SourceKind::XLuau,
+            span: Span::new(0, 0),
+            statements: vec![
+                Statement {
+                    kind: StatementKind::XLuauDeclaration,
+                    trailing: "\n".to_owned(),
+                    span: Span::new(0, 0),
+                    node: StatementNode::Local(LocalStatement {
+                        keyword: LocalKeyword::Const,
+                        bindings: "answer".to_owned(),
+                        value: Some("42".to_owned()),
+                    }),
+                },
+                Statement {
+                    kind: StatementKind::XLuauDeclaration,
+                    trailing: "\n".to_owned(),
+                    span: Span::new(0, 0),
+                    node: StatementNode::Local(LocalStatement {
+                        keyword: LocalKeyword::Let,
+                        bindings: "nextValue".to_owned(),
+                        value: Some("answer".to_owned()),
+                    }),
+                },
+            ],
+        };
+
+        let emitted = Emitter::new().emit(&program);
+        assert_eq!(emitted.text, "local answer = 42\nlocal nextValue = answer\n");
     }
 }
