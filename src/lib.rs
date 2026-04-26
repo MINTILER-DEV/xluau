@@ -8,6 +8,7 @@ mod formatter;
 mod lexer;
 mod lowering;
 mod parser;
+mod resolver;
 mod source;
 
 use std::path::PathBuf;

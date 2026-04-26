@@ -2,6 +2,7 @@ use crate::ast::{
     ConditionalKeyword, ExportKind, ImportKind, LocalKeyword, Program, Statement, StatementNode,
     SwitchLabel,
 };
+use crate::resolver::ResolvedModule;
 
 #[derive(Debug, Clone)]
 pub struct EmittedModule {
@@ -20,6 +21,31 @@ impl Emitter {
         EmittedModule {
             text: self.emit_statements(&program.statements),
         }
+    }
+
+    pub fn emit_resolved(&self, module: &ResolvedModule) -> EmittedModule {
+        let mut text = String::new();
+        if module.has_runtime_exports {
+            text.push_str("local _exports = {}\n");
+        }
+        for chunk in &module.chunks {
+            text.push_str(chunk.as_str());
+        }
+        if module.has_runtime_exports {
+            if !text.ends_with('\n') && !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("return _exports");
+        }
+        EmittedModule { text }
+    }
+
+    pub fn emit_single_statement(&self, statement: &Statement) -> String {
+        self.emit_statement(statement)
+    }
+
+    pub fn emit_node(&self, node: &StatementNode) -> String {
+        self.emit_embedded_node(node)
     }
 
     fn emit_statements(&self, statements: &[Statement]) -> String {

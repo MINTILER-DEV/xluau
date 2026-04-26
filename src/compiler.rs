@@ -13,6 +13,7 @@ use crate::formatter::Formatter;
 use crate::lexer::Lexer;
 use crate::lowering::Lowerer;
 use crate::parser::Parser;
+use crate::resolver::Resolver;
 use crate::source::{SourceFile, SourceKind};
 
 #[derive(Debug)]
@@ -88,6 +89,9 @@ impl Compiler {
             ));
         }
 
+        let mut resolver = Resolver::new(self.project_root.clone(), self.config.clone());
+        resolver.validate_entrypoints(&inputs)?;
+
         let mut compiled = Vec::with_capacity(inputs.len());
         let mut all_diagnostics = Vec::new();
         let mut warning_diagnostics: Vec<(Diagnostic, String)> = Vec::new();
@@ -137,7 +141,19 @@ impl Compiler {
                     .map(|diagnostic| (diagnostic, lowered_source.text.clone())),
             );
 
-            let emitted = Emitter::new().emit(&lowered_program);
+            let resolved_program = match resolver.resolve_program(&lowered_source, &lowered_program) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    all_diagnostics.push(Diagnostic::error(
+                        Some(&source.path),
+                        None,
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+
+            let emitted = Emitter::new().emit_resolved(&resolved_program);
             let output = Formatter::default().format(&emitted.text);
 
             compiled.push(CompiledFile {
@@ -316,7 +332,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::Compiler;
-    use crate::config::XLuauConfig;
+    use crate::config::{TargetKind, XLuauConfig};
 
     #[test]
     fn build_transpiles_xl_file_to_luau_output() {
@@ -351,5 +367,60 @@ mod tests {
             .expect("directory check");
 
         assert_eq!(summary.checked_files, 1);
+    }
+
+    #[test]
+    fn build_emits_phase_three_filesystem_modules() {
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src")).expect("src dir");
+        fs::write(
+            temp.path().join("src/math.xl"),
+            "export const answer = 42\nexport default answer\n",
+        )
+        .expect("math file");
+        fs::write(
+            temp.path().join("src/main.xl"),
+            "import value, { answer as named } from \"./math\"\nexport { value as default, named }\n",
+        )
+        .expect("main file");
+
+        let compiler =
+            Compiler::new(temp.path().to_path_buf(), XLuauConfig::default()).expect("compiler");
+        compiler.build(&[]).expect("build");
+
+        let math_output = fs::read_to_string(temp.path().join("out/math.luau")).expect("math output");
+        assert!(math_output.contains("local _exports = {}"));
+        assert!(math_output.contains("_exports.answer = answer"));
+        assert!(math_output.contains("_exports.__default = answer"));
+
+        let main_output = fs::read_to_string(temp.path().join("out/main.luau")).expect("main output");
+        assert!(main_output.contains("require(\"./math\")"));
+        assert!(main_output.contains("_exports.__default = value"));
+        assert!(main_output.contains("_exports.named = named"));
+    }
+
+    #[test]
+    fn build_emits_roblox_require_paths() {
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("src/server/players")).expect("players dir");
+        fs::write(
+            temp.path().join("src/server/players/PlayerManager.xl"),
+            "export function spawnPlayer()\n    return true\nend\n",
+        )
+        .expect("player manager");
+        fs::write(
+            temp.path().join("src/server/Game.xl"),
+            "import { spawnPlayer } from \"./players/PlayerManager\"\nspawnPlayer()\n",
+        )
+        .expect("game file");
+
+        let mut config = XLuauConfig::default();
+        config.target = TargetKind::Roblox;
+
+        let compiler = Compiler::new(temp.path().to_path_buf(), config).expect("compiler");
+        compiler.build(&[]).expect("build");
+
+        let output = fs::read_to_string(temp.path().join("out/server/Game.luau")).expect("output");
+        assert!(output.contains("require(script.Parent.players.PlayerManager)"));
     }
 }
