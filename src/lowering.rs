@@ -31,6 +31,17 @@ impl Lowerer {
         diagnostics: &mut Vec<Diagnostic>,
     ) -> String {
         self.push_scope();
+        let output = self.lower_program_statements(source, program, diagnostics);
+        self.pop_scope();
+        output
+    }
+
+    fn lower_program_statements(
+        &mut self,
+        source: &SourceFile,
+        program: &Program,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
         let mut output = String::new();
         for statement in &program.statements {
             output.push_str(&self.lower_statement(
@@ -39,7 +50,6 @@ impl Lowerer {
                 diagnostics,
             ));
         }
-        self.pop_scope();
         output
     }
 
@@ -61,7 +71,9 @@ impl Lowerer {
             TokenKind::Keyword(Keyword::Local) | TokenKind::Keyword(Keyword::Let) => {
                 self.lower_local_statement(&fragment, first, diagnostics)
             }
-            TokenKind::Keyword(Keyword::Return) => self.lower_return_statement(&fragment, first),
+            TokenKind::Keyword(Keyword::Return) => {
+                self.lower_return_statement(&fragment, first, diagnostics)
+            }
             TokenKind::Keyword(Keyword::If) => self.lower_if_statement(&path, text, diagnostics),
             TokenKind::Keyword(Keyword::While) => {
                 self.lower_while_statement(&path, text, diagnostics)
@@ -87,17 +99,33 @@ impl Lowerer {
         text: &str,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> String {
+        self.lower_nested_block_with_bindings(path, text, diagnostics, &[])
+    }
+
+    fn lower_nested_block_with_bindings(
+        &mut self,
+        path: PathBuf,
+        text: &str,
+        diagnostics: &mut Vec<Diagnostic>,
+        bindings: &[String],
+    ) -> String {
         let source = SourceFile::virtual_file(path, SourceKind::XLuau, text.to_owned());
         let tokens = Lexer::new(&source).lex(diagnostics);
         let program = crate::parser::Parser::new(&source, &tokens).parse(diagnostics);
-        self.lower_program(&source, &program, diagnostics)
+        self.push_scope();
+        for binding in bindings {
+            self.declare_local(binding);
+        }
+        let output = self.lower_program_statements(&source, &program, diagnostics);
+        self.pop_scope();
+        output
     }
 
     fn lower_const_statement(
         &mut self,
         fragment: &Fragment,
         const_index: usize,
-        _diagnostics: &mut Vec<Diagnostic>,
+        diagnostics: &mut Vec<Diagnostic>,
     ) -> String {
         let Some(name_start) = fragment.next_significant_after(const_index) else {
             return fragment.text.clone();
@@ -114,7 +142,7 @@ impl Lowerer {
         }
 
         let rhs = fragment.slice_between_tokens(assign_index + 1, fragment.tokens.len() - 1);
-        let lowered_rhs = self.lower_expression_list(rhs.trim());
+        let lowered_rhs = self.lower_expression_list_with_diagnostics(rhs.trim(), diagnostics);
         format!(
             "local {} = {}{}",
             names.join(", "),
@@ -167,7 +195,7 @@ impl Lowerer {
                     format!(
                         "local {} = {}{}",
                         lhs.trim(),
-                        self.lower_expression_list(rhs.trim()),
+                        self.lower_expression_list_with_diagnostics(rhs.trim(), diagnostics),
                         fragment.trailing_newline()
                     )
                 } else {
@@ -177,7 +205,12 @@ impl Lowerer {
         }
     }
 
-    fn lower_return_statement(&mut self, fragment: &Fragment, return_index: usize) -> String {
+    fn lower_return_statement(
+        &mut self,
+        fragment: &Fragment,
+        return_index: usize,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
         let exprs = fragment.slice_between_tokens(return_index + 1, fragment.tokens.len() - 1);
         if exprs.trim().is_empty() {
             return fragment.text.clone();
@@ -185,7 +218,7 @@ impl Lowerer {
 
         format!(
             "return {}{}",
-            self.lower_expression_list(exprs.trim()),
+            self.lower_expression_list_with_diagnostics(exprs.trim(), diagnostics),
             fragment.trailing_newline()
         )
     }
@@ -207,12 +240,36 @@ impl Lowerer {
 
         if let Some(index) = fragment.find_top_level_symbol(Symbol::Assign) {
             let lhs = fragment.slice_between_tokens(0, index).trim().to_owned();
+            if let Some(pattern) = parse_binding_pattern(lhs.as_str()) {
+                let mut binding_names = Vec::new();
+                collect_binding_names(&pattern, &mut binding_names);
+                for name in &binding_names {
+                    if self.resolve_assignment_to_const(name) {
+                        diagnostics.push(Diagnostic::error(
+                            Some(&fragment.path),
+                            Some(Span::new(0, fragment.text.len())),
+                            format!("cannot reassign const binding `{name}`"),
+                        ));
+                    }
+                }
+
+                let rhs = fragment.slice_between_tokens(index + 1, fragment.tokens.len() - 1);
+                let temp = self.next_temp("destructure_assign");
+                let mut lines = vec![format!(
+                    "local {} = {}",
+                    temp,
+                    self.lower_expression_list_with_diagnostics(rhs.trim(), diagnostics)
+                )];
+                self.emit_binding_pattern(&pattern, &temp, BindingEmitMode::Assign, &mut lines);
+                return format!("{}{}", lines.join("\n"), fragment.trailing_newline());
+            }
+
             self.check_const_reassignment(fragment, lhs.as_str(), diagnostics);
             let rhs = fragment.slice_between_tokens(index + 1, fragment.tokens.len() - 1);
             return format!(
                 "{} = {}{}",
                 lhs,
-                self.lower_expression_list(rhs.trim()),
+                self.lower_expression_list_with_diagnostics(rhs.trim(), diagnostics),
                 fragment.trailing_newline()
             );
         }
@@ -363,11 +420,21 @@ impl Lowerer {
             tokens[do_index].span.end,
             tokens[tokens.len() - 1].span.start,
         );
-        let lowered_body = self.lower_nested_block(path.clone(), &body, diagnostics);
 
         if head.contains(" in ") {
-            self.lower_generic_for(&head, lowered_body, fragment.trailing_newline())
+            self.lower_generic_for(&head, &body, path, diagnostics, fragment.trailing_newline())
         } else {
+            let loop_binding = head
+                .split_once('=')
+                .map(|(binding, _)| binding.trim().to_owned())
+                .into_iter()
+                .collect::<Vec<_>>();
+            let lowered_body = self.lower_nested_block_with_bindings(
+                path.clone(),
+                &body,
+                diagnostics,
+                &loop_binding,
+            );
             let numeric = self.lower_numeric_for_head(&head);
             format!(
                 "for {} do\n{}end{}",
@@ -407,8 +474,14 @@ impl Lowerer {
         }
 
         let body = fragment.text_between(body_start, tokens[end_index].span.start);
-        let (lowered_params, prologue) = self.lower_function_parameters(params.trim());
-        let lowered_body = self.lower_nested_block(path.clone(), &body, diagnostics);
+        let (lowered_params, prologue, param_bindings) =
+            self.lower_function_parameters(params.trim());
+        let lowered_body = self.lower_nested_block_with_bindings(
+            path.clone(),
+            &body,
+            diagnostics,
+            &param_bindings,
+        );
         let header_prefix = fragment.text_between(header_start, tokens[open_paren_index].span.end);
         let header_suffix = fragment.text_between(tokens[close_paren_index].span.start, body_start);
 
@@ -463,7 +536,7 @@ impl Lowerer {
         for section in sections {
             match section.label {
                 SwitchLabel::Case(exprs) => {
-                    if section.body.trim().is_empty() {
+                    if section.body.trim().is_empty() || section.body.trim() == "fallthrough" {
                         pending_labels.extend(exprs);
                         continue;
                     }
@@ -514,6 +587,11 @@ impl Lowerer {
             output.push_str(default_body.as_str());
             output.push_str("    end\n");
         } else {
+            diagnostics.push(Diagnostic::warning(
+                Some(path),
+                Some(Span::new(0, text.len())),
+                "switch statement has no default branch; exhaustiveness cannot be guaranteed",
+            ));
             output.push_str("    end\n");
         }
 
@@ -528,6 +606,147 @@ impl Lowerer {
             .map(|part| self.lower_expression(part.trim()))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    fn lower_expression_list_with_diagnostics(
+        &mut self,
+        text: &str,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
+        let parts = split_top_level(text, ',');
+        if parts.len() == 1 {
+            return self.lower_value_expression(parts[0].trim(), diagnostics);
+        }
+
+        parts
+            .into_iter()
+            .map(|part| self.lower_expression(part.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn lower_value_expression(&mut self, text: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
+        if let Some(lowered) = self.try_lower_switch_expression(text, diagnostics) {
+            lowered
+        } else {
+            self.lower_expression(text)
+        }
+    }
+
+    fn try_lower_switch_expression(
+        &mut self,
+        text: &str,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<String> {
+        let trimmed = text.trim();
+        if !trimmed.starts_with("switch ") {
+            return None;
+        }
+
+        let fragment = Fragment::new(PathBuf::from("<switch-expr>"), trimmed);
+        let tokens = fragment.significant_tokens();
+        if tokens.len() < 3 || tokens.first()?.kind != TokenKind::Keyword(Keyword::Switch) {
+            return None;
+        }
+
+        let switch_expr = fragment
+            .text_between(
+                tokens[0].span.end,
+                fragment
+                    .first_body_newline(&tokens)
+                    .unwrap_or(tokens[1].span.start),
+            )
+            .trim()
+            .to_owned();
+        let sections = fragment.switch_sections(&tokens);
+        let switch_value = self.next_temp("switch_expr");
+        let mut pending_labels = Vec::new();
+        let mut first_branch = true;
+        let mut has_default = false;
+        let mut output = String::new();
+
+        writeln!(output, "(function()").ok();
+        writeln!(
+            output,
+            "    local {} = {}",
+            switch_value,
+            self.lower_expression(switch_expr.as_str())
+        )
+        .ok();
+
+        for section in sections {
+            match section.label {
+                SwitchLabel::Case(exprs) => {
+                    if section.body.trim().is_empty() || section.body.trim() == "fallthrough" {
+                        pending_labels.extend(exprs);
+                        continue;
+                    }
+                    if section.body.trim().contains('\n') {
+                        diagnostics.push(Diagnostic::warning(
+                            None,
+                            None,
+                            "switch expression case body must be a single expression; leaving as regular expression",
+                        ));
+                        return None;
+                    }
+
+                    let mut all_exprs = pending_labels.clone();
+                    all_exprs.extend(exprs);
+                    pending_labels.clear();
+                    let lowered_conditions = all_exprs
+                        .iter()
+                        .map(|expr| {
+                            format!("{} == {}", switch_value, self.lower_expression(expr.trim()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" or ");
+                    let body_expr = self.lower_expression(section.body.trim());
+
+                    if first_branch {
+                        writeln!(output, "    if {} then", lowered_conditions).ok();
+                        first_branch = false;
+                    } else {
+                        writeln!(output, "    elseif {} then", lowered_conditions).ok();
+                    }
+                    writeln!(output, "        return {}", body_expr).ok();
+                }
+                SwitchLabel::Default => {
+                    has_default = true;
+                    if section.body.trim().contains('\n') {
+                        diagnostics.push(Diagnostic::warning(
+                            None,
+                            None,
+                            "switch expression default body must be a single expression; leaving as regular expression",
+                        ));
+                        return None;
+                    }
+                    let body_expr = self.lower_expression(section.body.trim());
+                    writeln!(output, "    else").ok();
+                    writeln!(output, "        return {}", body_expr).ok();
+                }
+            }
+        }
+
+        if !has_default {
+            diagnostics.push(Diagnostic::warning(
+                None,
+                None,
+                "switch expression has no default branch; returning nil when no case matches",
+            ));
+        }
+
+        if first_branch {
+            return None;
+        }
+
+        if !has_default {
+            writeln!(output, "    end").ok();
+            writeln!(output, "    return nil").ok();
+        } else {
+            writeln!(output, "    end").ok();
+        }
+        write!(output, "end)()").ok();
+        Some(output)
     }
 
     fn lower_expression(&mut self, text: &str) -> String {
@@ -671,6 +890,78 @@ impl Lowerer {
         )
     }
 
+    fn emit_binding_pattern(
+        &mut self,
+        pattern: &BindingPattern,
+        source_expr: &str,
+        mode: BindingEmitMode,
+        lines: &mut Vec<String>,
+    ) {
+        match pattern {
+            BindingPattern::Name(name) => {
+                if name != "_" {
+                    lines.push(format!("{}{} = {}", mode.prefix(), name, source_expr));
+                }
+            }
+            BindingPattern::Ignore => {}
+            BindingPattern::Object(object) => {
+                let excluded_keys = object
+                    .fields
+                    .iter()
+                    .map(|field| field.key.clone())
+                    .collect::<Vec<_>>();
+                for field in &object.fields {
+                    let mut access_expr = format!("{}.{}", source_expr, field.key);
+                    if let Some(default_value) = &field.default {
+                        let lowered_default = self.lower_expression(default_value.trim());
+                        access_expr = format!(
+                            "(if {expr} ~= nil then {expr} else {default_value})",
+                            expr = access_expr,
+                            default_value = lowered_default
+                        );
+                    }
+                    self.emit_binding_pattern(&field.binding, &access_expr, mode, lines);
+                }
+
+                if let Some(rest_name) = &object.rest {
+                    lines.push(format!("{}{} = {{}}", mode.prefix(), rest_name));
+                    lines.push(format!("for _k, _v in pairs({}) do", source_expr));
+                    if excluded_keys.is_empty() {
+                        lines.push(format!("    {}[_k] = _v", rest_name));
+                    } else {
+                        let condition = excluded_keys
+                            .iter()
+                            .map(|key| format!("_k ~= {:?}", key))
+                            .collect::<Vec<_>>()
+                            .join(" and ");
+                        lines.push(format!("    if {} then", condition));
+                        lines.push(format!("        {}[_k] = _v", rest_name));
+                        lines.push("    end".to_owned());
+                    }
+                    lines.push("end".to_owned());
+                }
+            }
+            BindingPattern::Array(array) => {
+                for (index, item) in array.items.iter().enumerate() {
+                    let access_expr = format!("{}[{}]", source_expr, index + 1);
+                    self.emit_binding_pattern(item, &access_expr, mode, lines);
+                }
+
+                if let Some(rest_name) = &array.rest {
+                    let start_index = array.items.len() + 1;
+                    lines.push(format!(
+                        "{}{} = table.move({}, {}, #{}, 1, {{}})",
+                        mode.prefix(),
+                        rest_name,
+                        source_expr,
+                        start_index,
+                        source_expr
+                    ));
+                }
+            }
+        }
+    }
+
     fn lower_destructuring_local(
         &mut self,
         fragment: &Fragment,
@@ -698,21 +989,15 @@ impl Lowerer {
         let lowered_expr = self.lower_expression(expr.trim());
 
         match parse_binding_pattern(pattern.trim()) {
-            Some(BindingPattern::Object(bindings)) => {
-                let mut lines = vec![format!("local {} = {}", temp, lowered_expr)];
-                for binding in bindings {
-                    lines.push(format!(
-                        "local {} = {}.{}",
-                        binding.alias, temp, binding.key
-                    ));
+            Some(pattern) => {
+                let mut binding_names = Vec::new();
+                collect_binding_names(&pattern, &mut binding_names);
+                for name in &binding_names {
+                    self.declare_local(name);
                 }
-                format!("{}{}", lines.join("\n"), fragment.trailing_newline())
-            }
-            Some(BindingPattern::Array(bindings)) => {
+
                 let mut lines = vec![format!("local {} = {}", temp, lowered_expr)];
-                for (index, binding) in bindings.iter().enumerate() {
-                    lines.push(format!("local {} = {}[{}]", binding.alias, temp, index + 1));
-                }
+                self.emit_binding_pattern(&pattern, &temp, BindingEmitMode::Local, &mut lines);
                 format!("{}{}", lines.join("\n"), fragment.trailing_newline())
             }
             None => {
@@ -729,10 +1014,13 @@ impl Lowerer {
     fn lower_generic_for(
         &mut self,
         head: &str,
-        lowered_body: String,
+        body: &str,
+        path: &PathBuf,
+        diagnostics: &mut Vec<Diagnostic>,
         trailing_newline: String,
     ) -> String {
         let Some((targets, exprs)) = head.split_once(" in ") else {
+            let lowered_body = self.lower_nested_block(path.clone(), body, diagnostics);
             return format!("for {} do\n{}end{}", head, lowered_body, trailing_newline);
         };
         let targets = targets.trim();
@@ -741,7 +1029,22 @@ impl Lowerer {
         match parse_binding_pattern(targets) {
             Some(pattern) => {
                 let temp = self.next_temp("iter");
-                let prologue = emit_binding_pattern(&pattern, temp.as_str());
+                let mut binding_names = Vec::new();
+                collect_binding_names(&pattern, &mut binding_names);
+                let lowered_body = self.lower_nested_block_with_bindings(
+                    path.clone(),
+                    body,
+                    diagnostics,
+                    &binding_names,
+                );
+                let mut prologue_lines = Vec::new();
+                self.emit_binding_pattern(
+                    &pattern,
+                    temp.as_str(),
+                    BindingEmitMode::Local,
+                    &mut prologue_lines,
+                );
+                let prologue = prologue_lines.join("\n");
                 format!(
                     "for {} in {} do\n{}{}end{}",
                     temp,
@@ -751,10 +1054,19 @@ impl Lowerer {
                     trailing_newline
                 )
             }
-            None => format!(
-                "for {} in {} do\n{}end{}",
-                targets, exprs, lowered_body, trailing_newline
-            ),
+            None => {
+                let loop_bindings = split_top_level(targets, ',');
+                let lowered_body = self.lower_nested_block_with_bindings(
+                    path.clone(),
+                    body,
+                    diagnostics,
+                    &loop_bindings,
+                );
+                format!(
+                    "for {} in {} do\n{}end{}",
+                    targets, exprs, lowered_body, trailing_newline
+                )
+            }
         }
     }
 
@@ -770,16 +1082,30 @@ impl Lowerer {
         )
     }
 
-    fn lower_function_parameters(&mut self, params: &str) -> (String, String) {
+    fn lower_function_parameters(&mut self, params: &str) -> (String, String, Vec<String>) {
         let mut lowered_params = Vec::new();
         let mut prologue = Vec::new();
+        let mut binding_names = Vec::new();
 
         for param in split_top_level(params, ',') {
             let trimmed = param.trim();
-            if let Some(pattern) = parse_binding_pattern(trimmed) {
+            if let Some((pattern, annotation)) = parse_destructured_parameter(trimmed) {
                 let temp = self.next_temp("param");
-                lowered_params.push(temp.clone());
-                prologue.push(emit_binding_pattern(&pattern, temp.as_str()));
+                let param_name = if let Some(annotation) = annotation {
+                    format!("{}: {}", temp, annotation)
+                } else {
+                    temp.clone()
+                };
+                lowered_params.push(param_name);
+                collect_binding_names(&pattern, &mut binding_names);
+                let mut lines = Vec::new();
+                self.emit_binding_pattern(
+                    &pattern,
+                    temp.as_str(),
+                    BindingEmitMode::Local,
+                    &mut lines,
+                );
+                prologue.push(lines.join("\n"));
             } else {
                 lowered_params.push(trimmed.to_owned());
             }
@@ -791,7 +1117,7 @@ impl Lowerer {
             format!("{}\n", indent_block(prologue.join("\n").as_str(), "    "))
         };
 
-        (lowered_params.join(", "), prelude)
+        (lowered_params.join(", "), prelude, binding_names)
     }
 
     fn next_temp(&mut self, prefix: &str) -> String {
@@ -1517,14 +1843,44 @@ fn infix_binding_power(token: &Token) -> Option<(u8, u8, InfixKind<'static>)> {
 
 #[derive(Debug, Clone)]
 enum BindingPattern {
-    Object(Vec<ObjectBinding>),
-    Array(Vec<ObjectBinding>),
+    Name(String),
+    Ignore,
+    Object(ObjectPattern),
+    Array(ArrayPattern),
 }
 
 #[derive(Debug, Clone)]
-struct ObjectBinding {
+struct ObjectPattern {
+    fields: Vec<ObjectField>,
+    rest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectField {
     key: String,
-    alias: String,
+    binding: BindingPattern,
+    default: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ArrayPattern {
+    items: Vec<BindingPattern>,
+    rest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BindingEmitMode {
+    Local,
+    Assign,
+}
+
+impl BindingEmitMode {
+    fn prefix(self) -> &'static str {
+        match self {
+            BindingEmitMode::Local => "local ",
+            BindingEmitMode::Assign => "",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1543,61 +1899,134 @@ fn parse_binding_pattern(text: &str) -> Option<BindingPattern> {
     let trimmed = text.trim();
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         let inner = &trimmed[1..trimmed.len() - 1];
-        let bindings = split_top_level(inner, ',')
-            .into_iter()
-            .map(|entry| {
-                let entry = entry.trim();
-                if let Some((key, alias)) = entry.split_once(':') {
-                    ObjectBinding {
-                        key: key.trim().to_owned(),
-                        alias: alias.trim().to_owned(),
-                    }
+        let mut fields = Vec::new();
+        let mut rest = None;
+        for entry in split_top_level(inner, ',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Some(name) = entry.strip_prefix("...") {
+                rest = Some(name.trim().to_owned());
+                continue;
+            }
+
+            let (binding_text, default) = if let Some((lhs, rhs)) = split_top_level_once(entry, '=')
+            {
+                (lhs.trim().to_owned(), Some(rhs.trim().to_owned()))
+            } else {
+                (entry.to_owned(), None)
+            };
+
+            let (key_text, target_text) =
+                if let Some((key, target)) = split_top_level_once(binding_text.as_str(), ':') {
+                    (key.trim().to_owned(), target.trim().to_owned())
                 } else {
-                    ObjectBinding {
-                        key: entry.to_owned(),
-                        alias: entry.to_owned(),
-                    }
-                }
-            })
-            .filter(|binding| !binding.alias.is_empty())
-            .collect::<Vec<_>>();
-        return Some(BindingPattern::Object(bindings));
+                    (
+                        binding_text.trim().to_owned(),
+                        binding_text.trim().to_owned(),
+                    )
+                };
+
+            fields.push(ObjectField {
+                key: key_text,
+                binding: parse_binding_target(target_text.as_str()),
+                default,
+            });
+        }
+
+        return Some(BindingPattern::Object(ObjectPattern { fields, rest }));
     }
 
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         let inner = &trimmed[1..trimmed.len() - 1];
-        let bindings = split_top_level(inner, ',')
-            .into_iter()
-            .map(|entry| {
-                let alias = entry.trim().to_owned();
-                ObjectBinding {
-                    key: alias.clone(),
-                    alias,
-                }
-            })
-            .filter(|binding| !binding.alias.is_empty())
-            .collect::<Vec<_>>();
-        return Some(BindingPattern::Array(bindings));
+        let mut items = Vec::new();
+        let mut rest = None;
+        for entry in split_top_level(inner, ',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Some(name) = entry.strip_prefix("...") {
+                rest = Some(name.trim().to_owned());
+                continue;
+            }
+            items.push(parse_binding_target(entry));
+        }
+
+        return Some(BindingPattern::Array(ArrayPattern { items, rest }));
     }
 
     None
 }
 
-fn emit_binding_pattern(pattern: &BindingPattern, source_name: &str) -> String {
+fn parse_binding_target(text: &str) -> BindingPattern {
+    if let Some(pattern) = parse_binding_pattern(text) {
+        pattern
+    } else if text.trim() == "_" {
+        BindingPattern::Ignore
+    } else {
+        BindingPattern::Name(text.trim().to_owned())
+    }
+}
+
+fn parse_destructured_parameter(text: &str) -> Option<(BindingPattern, Option<String>)> {
+    if let Some((binding, annotation)) = split_top_level_once(text, ':') {
+        let pattern = parse_binding_pattern(binding.trim())?;
+        return Some((pattern, Some(annotation.trim().to_owned())));
+    }
+
+    parse_binding_pattern(text).map(|pattern| (pattern, None))
+}
+
+fn split_top_level_once(text: &str, separator: char) -> Option<(String, String)> {
+    let mut paren = 0usize;
+    let mut brace = 0usize;
+    let mut bracket = 0usize;
+
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            _ => {}
+        }
+
+        if ch == separator && paren == 0 && brace == 0 && bracket == 0 {
+            return Some((
+                text[..index].to_owned(),
+                text[index + ch.len_utf8()..].to_owned(),
+            ));
+        }
+    }
+
+    None
+}
+
+fn collect_binding_names(pattern: &BindingPattern, names: &mut Vec<String>) {
     match pattern {
-        BindingPattern::Object(bindings) => bindings
-            .iter()
-            .map(|binding| format!("local {} = {}.{}", binding.alias, source_name, binding.key))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        BindingPattern::Array(bindings) => bindings
-            .iter()
-            .enumerate()
-            .map(|(index, binding)| {
-                format!("local {} = {}[{}]", binding.alias, source_name, index + 1)
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        BindingPattern::Name(name) if name != "_" => names.push(name.clone()),
+        BindingPattern::Ignore => {}
+        BindingPattern::Object(object) => {
+            for field in &object.fields {
+                collect_binding_names(&field.binding, names);
+            }
+            if let Some(rest) = &object.rest {
+                names.push(rest.clone());
+            }
+        }
+        BindingPattern::Array(array) => {
+            for item in &array.items {
+                collect_binding_names(item, names);
+            }
+            if let Some(rest) = &array.rest {
+                names.push(rest.clone());
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1704,6 +2133,29 @@ mod tests {
     }
 
     #[test]
+    fn lowers_nested_default_and_rest_destructuring() {
+        let (lowered, diagnostics) = lower(
+            "let { position: { x, y }, role = \"user\", ...rest } = config\nlet [head, _, ...tail] = items\n",
+        );
+
+        assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
+        assert!(lowered.contains("local x = _xluau_destructure_1.position.x"));
+        assert!(lowered.contains("if _xluau_destructure_1.role ~= nil"));
+        assert!(lowered.contains("for _k, _v in pairs(_xluau_destructure_1) do"));
+        assert!(lowered.contains("local tail = table.move(_xluau_destructure_2, 3"));
+    }
+
+    #[test]
+    fn lowers_plain_destructuring_assignment() {
+        let (lowered, diagnostics) = lower("{x, y: z} = point\n");
+
+        assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
+        assert!(lowered.contains("local _xluau_destructure_assign_"));
+        assert!(lowered.contains("x = _xluau_destructure_assign_"));
+        assert!(lowered.contains("z = _xluau_destructure_assign_"));
+    }
+
+    #[test]
     fn lowers_function_param_and_for_destructuring() {
         let (lowered, diagnostics) = lower(
             "function demo({x, y}, [a, b])\n    for [left, right] in pairs(items) do\n        print(x, y, a, b, left, right)\n    end\nend\n",
@@ -1717,11 +2169,25 @@ mod tests {
 
     #[test]
     fn lowers_switch_fallthrough_labels() {
-        let (lowered, diagnostics) =
-            lower("switch value\ncase 1:\ncase 2:\n    print(\"hit\")\nend\n");
+        let (lowered, diagnostics) = lower(
+            "switch value\ncase 1:\ncase 2:\n    fallthrough\ncase 3:\n    print(\"hit\")\nend\n",
+        );
 
         assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
         assert!(lowered.contains("== 1 or"));
         assert!(lowered.contains("== 2"));
+        assert!(lowered.contains("== 3"));
+    }
+
+    #[test]
+    fn lowers_switch_expression_to_iife() {
+        let (lowered, diagnostics) = lower(
+            "local label = switch count\ncase 0: \"none\"\ncase 1: \"one\"\ndefault: \"many\"\nend\n",
+        );
+
+        assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
+        assert!(lowered.contains("(function()"));
+        assert!(lowered.contains("return \"none\""));
+        assert!(lowered.contains("return \"many\""));
     }
 }

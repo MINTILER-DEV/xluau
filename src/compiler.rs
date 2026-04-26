@@ -90,6 +90,7 @@ impl Compiler {
 
         let mut compiled = Vec::with_capacity(inputs.len());
         let mut all_diagnostics = Vec::new();
+        let mut warning_diagnostics: Vec<(Diagnostic, String)> = Vec::new();
 
         for path in inputs {
             let source = SourceFile::load(path)?;
@@ -102,6 +103,11 @@ impl Compiler {
                 all_diagnostics.extend(diagnostics);
                 continue;
             }
+            warning_diagnostics.extend(
+                diagnostics
+                    .drain(..)
+                    .map(|diagnostic| (diagnostic, source.text.clone())),
+            );
 
             let lowered_text = Lowerer::new().lower_program(&source, &program, &mut diagnostics);
 
@@ -109,6 +115,11 @@ impl Compiler {
                 all_diagnostics.extend(diagnostics);
                 continue;
             }
+            warning_diagnostics.extend(
+                diagnostics
+                    .drain(..)
+                    .map(|diagnostic| (diagnostic, source.text.clone())),
+            );
 
             let lowered_source =
                 SourceFile::virtual_file(source.path.clone(), SourceKind::Luau, lowered_text);
@@ -120,6 +131,11 @@ impl Compiler {
                 all_diagnostics.extend(diagnostics);
                 continue;
             }
+            warning_diagnostics.extend(
+                diagnostics
+                    .drain(..)
+                    .map(|diagnostic| (diagnostic, lowered_source.text.clone())),
+            );
 
             let emitted = Emitter::new().emit(&lowered_program);
             let output = Formatter::default().format(&emitted.text);
@@ -136,6 +152,11 @@ impl Compiler {
         }
 
         if all_diagnostics.is_empty() {
+            for (diagnostic, source_text) in warning_diagnostics {
+                if !diagnostic.is_error() {
+                    eprintln!("{}", diagnostic.render(Some(&source_text)));
+                }
+            }
             Ok(compiled)
         } else {
             Err(XLuauError::diagnostics(all_diagnostics))
