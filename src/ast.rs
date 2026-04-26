@@ -22,6 +22,8 @@ pub struct Statement {
 pub enum StatementNode {
     Trivia(String),
     Text(String),
+    Import(ImportStatement),
+    Export(ExportStatement),
     Local(LocalStatement),
     Return(ReturnStatement),
     If(IfStatement),
@@ -38,6 +40,60 @@ pub struct LocalStatement {
     pub keyword: LocalKeyword,
     pub bindings: String,
     pub value: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportStatement {
+    pub kind: ImportKind,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ImportKind {
+    SideEffect,
+    TypeNamed {
+        named: Vec<NamedImportSpecifier>,
+    },
+    Value {
+        default: Option<String>,
+        namespace: Option<String>,
+        named: Vec<NamedImportSpecifier>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct NamedImportSpecifier {
+    pub imported: String,
+    pub local: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportStatement {
+    pub kind: ExportKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExportKind {
+    Declaration(Box<StatementNode>),
+    Named {
+        specifiers: Vec<NamedExportSpecifier>,
+        source: Option<String>,
+        is_type_only: bool,
+    },
+    All {
+        source: String,
+        is_type_only: bool,
+    },
+    Default {
+        expression: String,
+    },
+    TypeDeclaration(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct NamedExportSpecifier {
+    pub local: String,
+    pub exported: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,8 +1,9 @@
 use crate::ast::{
     BlockStatement, ConditionalClause, ConditionalKeyword, ForStatement, FunctionStatement,
-    IfStatement, LocalKeyword, LocalStatement, Program, RepeatStatement, ReturnStatement,
+    IfStatement, ImportKind, ImportStatement, LocalKeyword, LocalStatement,
+    NamedExportSpecifier, NamedImportSpecifier, Program, RepeatStatement, ReturnStatement,
     Statement, StatementKind, StatementNode, SwitchLabel, SwitchSection, SwitchStatement,
-    WhileStatement,
+    WhileStatement, ExportKind, ExportStatement,
 };
 use crate::diagnostic::{Diagnostic, Span};
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
@@ -187,6 +188,8 @@ impl<'a> Parser<'a> {
         };
 
         match fragment.tokens[first].kind {
+            TokenKind::Keyword(Keyword::Import) => self.parse_import_statement(text),
+            TokenKind::Keyword(Keyword::Export) => self.parse_export_statement(text),
             TokenKind::Keyword(Keyword::Const) => self.parse_local_statement(text, LocalKeyword::Const),
             TokenKind::Keyword(Keyword::Let) => self.parse_local_statement(text, LocalKeyword::Let),
             TokenKind::Keyword(Keyword::Local) => {
@@ -207,6 +210,308 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Switch) => self.parse_switch_statement(text),
             _ => StatementNode::Text(text.to_owned()),
         }
+    }
+
+    fn parse_import_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let mut cursor = 1usize;
+
+        let is_type_only = matches!(
+            tokens.get(cursor).map(|token| token.kind.clone()),
+            Some(TokenKind::Keyword(Keyword::Type))
+        );
+        if is_type_only {
+            cursor += 1;
+        }
+
+        if tokens
+            .get(cursor)
+            .map(|token| matches!(token.kind, TokenKind::String))
+            .unwrap_or(false)
+        {
+            return StatementNode::Import(ImportStatement {
+                kind: ImportKind::SideEffect,
+                source: unquote_string(tokens[cursor].lexeme.as_str()),
+            });
+        }
+
+        let mut default = None;
+        let mut namespace = None;
+        let mut named = Vec::new();
+
+        match tokens.get(cursor).map(|token| &token.kind) {
+            Some(TokenKind::Symbol(Symbol::Star)) => {
+                cursor += 1;
+                if tokens
+                    .get(cursor)
+                    .map(|token| token.lexeme.as_str() == "as")
+                    .unwrap_or(false)
+                {
+                    cursor += 1;
+                }
+                namespace = tokens.get(cursor).map(token_text_owned);
+                cursor += 1;
+            }
+            Some(TokenKind::Symbol(Symbol::LeftBrace)) => {
+                let end = fragment.matching_delimiter(
+                    &tokens,
+                    cursor,
+                    Symbol::LeftBrace,
+                    Symbol::RightBrace,
+                );
+                named = self.parse_named_import_specifiers(&fragment, &tokens, cursor, end);
+                cursor = end + 1;
+            }
+            Some(_) => {
+                default = tokens.get(cursor).map(token_text_owned);
+                cursor += 1;
+                if matches!(
+                    tokens.get(cursor).map(|token| token.kind.clone()),
+                    Some(TokenKind::Symbol(Symbol::Comma))
+                ) {
+                    cursor += 1;
+                    match tokens.get(cursor).map(|token| token.kind.clone()) {
+                        Some(TokenKind::Symbol(Symbol::Star)) => {
+                            cursor += 1;
+                            if tokens
+                                .get(cursor)
+                                .map(|token| token.lexeme.as_str() == "as")
+                                .unwrap_or(false)
+                            {
+                                cursor += 1;
+                            }
+                            namespace = tokens.get(cursor).map(token_text_owned);
+                            cursor += 1;
+                        }
+                        Some(TokenKind::Symbol(Symbol::LeftBrace)) => {
+                            let end = fragment.matching_delimiter(
+                                &tokens,
+                                cursor,
+                                Symbol::LeftBrace,
+                                Symbol::RightBrace,
+                            );
+                            named =
+                                self.parse_named_import_specifiers(&fragment, &tokens, cursor, end);
+                            cursor = end + 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None => {}
+        }
+
+        let source = tokens
+            .iter()
+            .skip(cursor)
+            .find(|token| matches!(token.kind, TokenKind::String))
+            .map(|token| unquote_string(token.lexeme.as_str()))
+            .unwrap_or_default();
+
+        let kind = if is_type_only {
+            ImportKind::TypeNamed { named }
+        } else {
+            ImportKind::Value {
+                default,
+                namespace,
+                named,
+            }
+        };
+
+        StatementNode::Import(ImportStatement { kind, source })
+    }
+
+    fn parse_export_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        if tokens.len() < 2 {
+            return StatementNode::Export(ExportStatement {
+                kind: ExportKind::Declaration(Box::new(StatementNode::Text(text.to_owned()))),
+            });
+        }
+        let mut cursor = 1usize;
+
+        let is_type_only = matches!(
+            tokens.get(cursor).map(|token| token.kind.clone()),
+            Some(TokenKind::Keyword(Keyword::Type))
+        );
+        if is_type_only {
+            cursor += 1;
+        }
+
+        let kind = if is_type_only {
+            match tokens.get(cursor).map(|token| token.kind.clone()) {
+                Some(TokenKind::Symbol(Symbol::LeftBrace)) => {
+                    let end = fragment.matching_delimiter(
+                        &tokens,
+                        cursor,
+                        Symbol::LeftBrace,
+                        Symbol::RightBrace,
+                    );
+                    let specifiers =
+                        self.parse_named_export_specifiers(&fragment, &tokens, cursor, end);
+                    let source = tokens
+                        .iter()
+                        .skip(end + 1)
+                        .find(|token| matches!(token.kind, TokenKind::String))
+                        .map(|token| unquote_string(token.lexeme.as_str()));
+                    ExportKind::Named {
+                        specifiers,
+                        source,
+                        is_type_only: true,
+                    }
+                }
+                Some(TokenKind::Symbol(Symbol::Star)) => {
+                    let source = tokens
+                        .iter()
+                        .skip(cursor + 1)
+                        .find(|token| matches!(token.kind, TokenKind::String))
+                        .map(|token| unquote_string(token.lexeme.as_str()))
+                        .unwrap_or_default();
+                    ExportKind::All {
+                        source,
+                        is_type_only: true,
+                    }
+                }
+                _ => ExportKind::TypeDeclaration(
+                    fragment
+                        .text_between(tokens[1].span.start, text.len())
+                        .trim()
+                        .to_owned(),
+                ),
+            }
+        } else {
+            match tokens.get(cursor).map(|token| token.kind.clone()) {
+            Some(TokenKind::Keyword(Keyword::Function)) => ExportKind::Declaration(Box::new(
+                self.parse_statement_node(
+                    StatementKind::Luau,
+                    fragment.text_between(tokens[cursor].span.start, text.len()).as_str(),
+                ),
+            )),
+            Some(TokenKind::Keyword(Keyword::Local)) => ExportKind::Declaration(Box::new(
+                self.parse_statement_node(
+                    StatementKind::Luau,
+                    fragment.text_between(tokens[cursor].span.start, text.len()).as_str(),
+                ),
+            )),
+            Some(TokenKind::Keyword(Keyword::Let)) => ExportKind::Declaration(Box::new(
+                self.parse_statement_node(
+                    StatementKind::XLuauDeclaration,
+                    fragment.text_between(tokens[cursor].span.start, text.len()).as_str(),
+                ),
+            )),
+            Some(TokenKind::Keyword(Keyword::Const)) => ExportKind::Declaration(Box::new(
+                self.parse_statement_node(
+                    StatementKind::XLuauDeclaration,
+                    fragment.text_between(tokens[cursor].span.start, text.len()).as_str(),
+                ),
+            )),
+            Some(TokenKind::Keyword(Keyword::Default)) if !is_type_only => {
+                let expression = fragment
+                    .text_between(tokens[cursor].span.end, text.len())
+                    .trim()
+                    .to_owned();
+                ExportKind::Default { expression }
+            }
+            Some(TokenKind::Symbol(Symbol::LeftBrace)) => {
+                let end = fragment.matching_delimiter(
+                    &tokens,
+                    cursor,
+                    Symbol::LeftBrace,
+                    Symbol::RightBrace,
+                );
+                let specifiers = self.parse_named_export_specifiers(&fragment, &tokens, cursor, end);
+                let source = tokens
+                    .iter()
+                    .skip(end + 1)
+                    .find(|token| matches!(token.kind, TokenKind::String))
+                    .map(|token| unquote_string(token.lexeme.as_str()));
+                ExportKind::Named {
+                    specifiers,
+                    source,
+                    is_type_only,
+                }
+            }
+            Some(TokenKind::Symbol(Symbol::Star)) => {
+                let source = tokens
+                    .iter()
+                    .skip(cursor + 1)
+                    .find(|token| matches!(token.kind, TokenKind::String))
+                    .map(|token| unquote_string(token.lexeme.as_str()))
+                    .unwrap_or_default();
+                ExportKind::All {
+                    source,
+                    is_type_only,
+                }
+            }
+            _ => ExportKind::Declaration(Box::new(StatementNode::Text(
+                fragment
+                    .text_between(tokens[cursor.min(tokens.len() - 1)].span.start, text.len())
+                    .trim()
+                    .to_owned(),
+            ))),
+        }};
+
+        StatementNode::Export(ExportStatement { kind })
+    }
+
+    fn parse_named_import_specifiers(
+        &self,
+        fragment: &Fragment,
+        tokens: &[Token],
+        start: usize,
+        end: usize,
+    ) -> Vec<NamedImportSpecifier> {
+        split_top_level(
+            fragment
+                .text_between(tokens[start].span.end, tokens[end].span.start)
+                .as_str(),
+            ',',
+        )
+        .into_iter()
+        .filter_map(|entry| {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let (imported, local) = if let Some((left, right)) = split_keyword_alias(trimmed, "as") {
+                (left.trim().to_owned(), right.trim().to_owned())
+            } else {
+                (trimmed.to_owned(), trimmed.to_owned())
+            };
+            Some(NamedImportSpecifier { imported, local })
+        })
+        .collect()
+    }
+
+    fn parse_named_export_specifiers(
+        &self,
+        fragment: &Fragment,
+        tokens: &[Token],
+        start: usize,
+        end: usize,
+    ) -> Vec<NamedExportSpecifier> {
+        split_top_level(
+            fragment
+                .text_between(tokens[start].span.end, tokens[end].span.start)
+                .as_str(),
+            ',',
+        )
+        .into_iter()
+        .filter_map(|entry| {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let (local, exported) = if let Some((left, right)) = split_keyword_alias(trimmed, "as") {
+                (left.trim().to_owned(), right.trim().to_owned())
+            } else {
+                (trimmed.to_owned(), trimmed.to_owned())
+            };
+            Some(NamedExportSpecifier { local, exported })
+        })
+        .collect()
     }
 
     fn parse_local_statement(&self, text: &str, keyword: LocalKeyword) -> StatementNode {
@@ -469,6 +774,70 @@ fn split_statement_suffix(tokens: &[Token], text: &str) -> (String, String) {
     (text.to_owned(), String::new())
 }
 
+fn token_text(token: &Token) -> &str {
+    token.lexeme.as_str()
+}
+
+fn token_text_owned(token: &Token) -> String {
+    token_text(token).to_owned()
+}
+
+fn unquote_string(text: &str) -> String {
+    if text.len() >= 2 {
+        let bytes = text.as_bytes();
+        let first = bytes[0] as char;
+        let last = bytes[text.len() - 1] as char;
+        if matches!(first, '"' | '\'' | '`') && first == last {
+            return text[1..text.len() - 1].to_owned();
+        }
+    }
+
+    text.to_owned()
+}
+
+fn split_keyword_alias(text: &str, keyword: &str) -> Option<(String, String)> {
+    let needle = format!(" {keyword} ");
+    text.find(&needle).map(|index| {
+        (
+            text[..index].to_owned(),
+            text[index + needle.len()..].to_owned(),
+        )
+    })
+}
+
+fn split_top_level(text: &str, separator: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut paren = 0usize;
+    let mut brace = 0usize;
+    let mut bracket = 0usize;
+
+    for ch in text.chars() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            _ => {}
+        }
+
+        if ch == separator && paren == 0 && brace == 0 && bracket == 0 {
+            parts.push(current.trim().to_owned());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_owned());
+    }
+
+    parts
+}
+
 fn classify_statement(tokens: &[Token]) -> StatementKind {
     let significant: Vec<&Token> = tokens.iter().filter(|token| !token.is_trivia()).collect();
     if significant.is_empty() {
@@ -702,11 +1071,21 @@ impl Fragment {
     }
 
     fn matching_paren(&self, tokens: &[Token], start: usize) -> usize {
+        self.matching_delimiter(tokens, start, Symbol::LeftParen, Symbol::RightParen)
+    }
+
+    fn matching_delimiter(
+        &self,
+        tokens: &[Token],
+        start: usize,
+        open: Symbol,
+        close: Symbol,
+    ) -> usize {
         let mut depth = 0usize;
         for (index, token) in tokens.iter().enumerate().skip(start) {
             match token.kind {
-                TokenKind::Symbol(Symbol::LeftParen) => depth += 1,
-                TokenKind::Symbol(Symbol::RightParen) => {
+                TokenKind::Symbol(symbol) if symbol == open => depth += 1,
+                TokenKind::Symbol(symbol) if symbol == close => {
                     depth -= 1;
                     if depth == 0 {
                         return index;
@@ -846,7 +1225,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::Parser;
-    use crate::ast::{StatementKind, StatementNode, SwitchLabel};
+    use crate::ast::{ExportKind, ImportKind, StatementKind, StatementNode, SwitchLabel};
     use crate::lexer::Lexer;
     use crate::source::{SourceFile, SourceKind};
 
@@ -904,6 +1283,53 @@ mod tests {
                 assert!(matches!(switch.sections[1].label, SwitchLabel::Default));
             }
             other => panic!("expected switch node, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_builds_import_and_export_nodes() {
+        let source = SourceFile {
+            path: PathBuf::from("test.xl"),
+            kind: SourceKind::XLuau,
+            text: "import React, { useState as state } from \"./react\"\nexport { React as default, state }\n".to_owned(),
+        };
+        let tokens = Lexer::new(&source).lex(&mut Vec::new());
+        let program = Parser::new(&source, &tokens).parse(&mut Vec::new());
+
+        match &program.statements[0].node {
+            StatementNode::Import(import) => match &import.kind {
+                ImportKind::Value {
+                    default,
+                    namespace,
+                    named,
+                } => {
+                    assert_eq!(default.as_deref(), Some("React"));
+                    assert!(namespace.is_none());
+                    assert_eq!(named[0].imported, "useState");
+                    assert_eq!(named[0].local, "state");
+                }
+                other => panic!("expected value import, found {other:?}"),
+            },
+            other => panic!("expected import node, found {other:?}"),
+        }
+
+        match &program.statements[1].node {
+            StatementNode::Export(export) => match &export.kind {
+                ExportKind::Named {
+                    specifiers,
+                    source,
+                    is_type_only,
+                } => {
+                    assert!(!is_type_only);
+                    assert!(source.is_none());
+                    assert_eq!(specifiers[0].local, "React");
+                    assert_eq!(specifiers[0].exported, "default");
+                    assert_eq!(specifiers[1].local, "state");
+                    assert_eq!(specifiers[1].exported, "state");
+                }
+                other => panic!("expected named export, found {other:?}"),
+            },
+            other => panic!("expected export node, found {other:?}"),
         }
     }
 }

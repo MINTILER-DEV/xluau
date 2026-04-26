@@ -1,5 +1,6 @@
 use crate::ast::{
-    ConditionalKeyword, LocalKeyword, Program, Statement, StatementNode, SwitchLabel,
+    ConditionalKeyword, ExportKind, ImportKind, LocalKeyword, Program, Statement, StatementNode,
+    SwitchLabel,
 };
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,94 @@ impl Emitter {
     fn emit_statement(&self, statement: &Statement) -> String {
         let mut text = match &statement.node {
             StatementNode::Trivia(text) | StatementNode::Text(text) => text.clone(),
+            StatementNode::Import(import) => match &import.kind {
+                ImportKind::SideEffect => format!("import \"{}\"", import.source),
+                ImportKind::TypeNamed { named } => format!(
+                    "import type {{ {} }} from \"{}\"",
+                    named
+                        .iter()
+                        .map(|specifier| {
+                            if specifier.imported == specifier.local {
+                                specifier.imported.clone()
+                            } else {
+                                format!("{} as {}", specifier.imported, specifier.local)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    import.source
+                ),
+                ImportKind::Value {
+                    default,
+                    namespace,
+                    named,
+                } => {
+                    let mut parts = Vec::new();
+                    if let Some(default) = default {
+                        parts.push(default.clone());
+                    }
+                    if let Some(namespace) = namespace {
+                        parts.push(format!("* as {namespace}"));
+                    }
+                    if !named.is_empty() {
+                        parts.push(format!(
+                            "{{ {} }}",
+                            named
+                                .iter()
+                                .map(|specifier| {
+                                    if specifier.imported == specifier.local {
+                                        specifier.imported.clone()
+                                    } else {
+                                        format!("{} as {}", specifier.imported, specifier.local)
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    format!("import {} from \"{}\"", parts.join(", "), import.source)
+                }
+            },
+            StatementNode::Export(export) => match &export.kind {
+                ExportKind::Declaration(node) => {
+                    format!("export {}", self.emit_embedded_node(node))
+                }
+                ExportKind::Named {
+                    specifiers,
+                    source,
+                    is_type_only,
+                } => {
+                    let mut output = format!(
+                        "export{} {{ {} }}",
+                        if *is_type_only { " type" } else { "" },
+                        specifiers
+                            .iter()
+                            .map(|specifier| {
+                                if specifier.local == specifier.exported {
+                                    specifier.local.clone()
+                                } else {
+                                    format!("{} as {}", specifier.local, specifier.exported)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    if let Some(source) = source {
+                        output.push_str(format!(" from \"{}\"", source).as_str());
+                    }
+                    output
+                }
+                ExportKind::All {
+                    source,
+                    is_type_only,
+                } => format!(
+                    "export{} * from \"{}\"",
+                    if *is_type_only { " type" } else { "" },
+                    source
+                ),
+                ExportKind::Default { expression } => format!("export default {expression}"),
+                ExportKind::TypeDeclaration(text) => format!("export {text}"),
+            },
             StatementNode::Local(local) => {
                 let keyword = match local.keyword {
                     LocalKeyword::Local => "local",
@@ -105,6 +194,16 @@ impl Emitter {
         };
         text.push_str(statement.trailing.as_str());
         text
+    }
+
+    fn emit_embedded_node(&self, node: &StatementNode) -> String {
+        let statement = Statement {
+            kind: crate::ast::StatementKind::Luau,
+            node: node.clone(),
+            trailing: String::new(),
+            span: crate::diagnostic::Span::new(0, 0),
+        };
+        self.emit_statement(&statement)
     }
 }
 

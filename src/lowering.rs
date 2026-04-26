@@ -7,6 +7,7 @@ use crate::ast::{
     SwitchLabel as AstSwitchLabel,
 };
 use crate::diagnostic::{Diagnostic, Span};
+use crate::emitter::Emitter;
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
 use crate::source::{SourceFile, SourceKind};
 
@@ -72,6 +73,9 @@ impl Lowerer {
     ) -> String {
         let mut output = match &statement.node {
             StatementNode::Trivia(text) => text.clone(),
+            StatementNode::Import(_) | StatementNode::Export(_) => {
+                self.reemit_statement_node(&statement.node)
+            }
             StatementNode::Text(text) => match statement.kind {
                 StatementKind::ImportDeclaration
                 | StatementKind::ExportDeclaration
@@ -159,6 +163,20 @@ impl Lowerer {
         };
         output.push_str(statement.trailing.as_str());
         output
+    }
+
+    fn reemit_statement_node(&self, node: &StatementNode) -> String {
+        let program = Program {
+            source_kind: SourceKind::XLuau,
+            span: Span::new(0, 0),
+            statements: vec![Statement {
+                kind: StatementKind::Luau,
+                node: node.clone(),
+                trailing: String::new(),
+                span: Span::new(0, 0),
+            }],
+        };
+        Emitter::new().emit(&program).text
     }
 
     fn lower_statement(
