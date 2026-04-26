@@ -10,7 +10,13 @@ use crate::source::{SourceFile, SourceKind};
 #[derive(Debug, Default)]
 pub struct Lowerer {
     next_temp_id: usize,
-    const_bindings: HashSet<String>,
+    scopes: Vec<ScopeFrame>,
+}
+
+#[derive(Debug, Default)]
+struct ScopeFrame {
+    locals: HashSet<String>,
+    consts: HashSet<String>,
 }
 
 impl Lowerer {
@@ -24,6 +30,7 @@ impl Lowerer {
         program: &Program,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> String {
+        self.push_scope();
         let mut output = String::new();
         for statement in &program.statements {
             output.push_str(&self.lower_statement(
@@ -32,6 +39,7 @@ impl Lowerer {
                 diagnostics,
             ));
         }
+        self.pop_scope();
         output
     }
 
@@ -50,7 +58,7 @@ impl Lowerer {
             TokenKind::Keyword(Keyword::Const) => {
                 self.lower_const_statement(&fragment, first, diagnostics)
             }
-            TokenKind::Keyword(Keyword::Local) => {
+            TokenKind::Keyword(Keyword::Local) | TokenKind::Keyword(Keyword::Let) => {
                 self.lower_local_statement(&fragment, first, diagnostics)
             }
             TokenKind::Keyword(Keyword::Return) => self.lower_return_statement(&fragment, first),
@@ -102,7 +110,7 @@ impl Lowerer {
             .top_level_identifier_list(name_start, assign_index)
             .unwrap_or_default();
         for name in &names {
-            self.const_bindings.insert(name.clone());
+            self.declare_const(name);
         }
 
         let rhs = fragment.slice_between_tokens(assign_index + 1, fragment.tokens.len() - 1);
@@ -127,12 +135,31 @@ impl Lowerer {
 
         match fragment.tokens[next_index].kind {
             TokenKind::Keyword(Keyword::Function) => {
+                if let Some(function_name_index) = fragment.next_significant_after(next_index) {
+                    if let TokenKind::Identifier = fragment.tokens[function_name_index].kind {
+                        self.declare_local(fragment.tokens[function_name_index].lexeme.as_str());
+                    }
+                }
                 self.lower_function_statement(&fragment.path, fragment.text.as_str(), diagnostics)
             }
             TokenKind::Symbol(Symbol::LeftBrace) | TokenKind::Symbol(Symbol::LeftBracket) => {
                 self.lower_destructuring_local(fragment, next_index, diagnostics)
             }
             _ => {
+                let names =
+                    if let Some(assign_index) = fragment.find_top_level_symbol(Symbol::Assign) {
+                        fragment
+                            .top_level_identifier_list(local_index + 1, assign_index)
+                            .unwrap_or_default()
+                    } else {
+                        fragment
+                            .top_level_identifier_list(local_index + 1, fragment.tokens.len() - 1)
+                            .unwrap_or_default()
+                    };
+                for name in &names {
+                    self.declare_local(name);
+                }
+
                 if let Some(assign_index) = fragment.find_top_level_symbol(Symbol::Assign) {
                     let lhs = fragment.slice_between_tokens(local_index + 1, assign_index);
                     let rhs =
@@ -144,7 +171,7 @@ impl Lowerer {
                         fragment.trailing_newline()
                     )
                 } else {
-                    fragment.text.clone()
+                    format!("local {}{}", names.join(", "), fragment.trailing_newline())
                 }
             }
         }
@@ -780,7 +807,7 @@ impl Lowerer {
     ) {
         for name in split_top_level(lhs, ',') {
             let name = name.trim();
-            if self.const_bindings.contains(name) {
+            if self.resolve_assignment_to_const(name) {
                 diagnostics.push(Diagnostic::error(
                     Some(&fragment.path),
                     Some(Span::new(0, fragment.text.len())),
@@ -788,6 +815,37 @@ impl Lowerer {
                 ));
             }
         }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(ScopeFrame::default());
+    }
+
+    fn pop_scope(&mut self) {
+        let _ = self.scopes.pop();
+    }
+
+    fn declare_local(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.locals.insert(name.to_owned());
+        }
+    }
+
+    fn declare_const(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.locals.insert(name.to_owned());
+            scope.consts.insert(name.to_owned());
+        }
+    }
+
+    fn resolve_assignment_to_const(&self, name: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if scope.locals.contains(name) {
+                return scope.consts.contains(name);
+            }
+        }
+
+        false
     }
 }
 
@@ -1622,6 +1680,15 @@ mod tests {
     fn lowers_const_and_reports_reassignment() {
         let (_, diagnostics) = lower("const answer = 42\nanswer = 0\n");
         assert!(diagnostics.iter().any(Diagnostic::is_error));
+    }
+
+    #[test]
+    fn let_is_lowered_like_local_and_shadowing_stops_const_errors() {
+        let (lowered, diagnostics) =
+            lower("const value = 1\nif true then\n    let value = 2\n    value = 3\nend\n");
+
+        assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
+        assert!(lowered.contains("local value = 2"));
     }
 
     #[test]

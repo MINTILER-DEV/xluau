@@ -184,6 +184,7 @@ fn classify_statement(tokens: &[Token]) -> StatementKind {
         TokenKind::Keyword(Keyword::Class)
         | TokenKind::Keyword(Keyword::Const)
         | TokenKind::Keyword(Keyword::Enum)
+        | TokenKind::Keyword(Keyword::Let)
         | TokenKind::Keyword(Keyword::Macro)
         | TokenKind::Keyword(Keyword::Switch) => StatementKind::XLuauDeclaration,
         TokenKind::Symbol(Symbol::At) => StatementKind::XLuauDeclaration,
