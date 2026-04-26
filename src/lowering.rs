@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::ast::Program;
+use crate::ast::{
+    ConditionalKeyword, LocalKeyword, Program, Statement, StatementKind, StatementNode,
+    SwitchLabel as AstSwitchLabel,
+};
 use crate::diagnostic::{Diagnostic, Span};
 use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
 use crate::source::{SourceFile, SourceKind};
@@ -42,14 +45,119 @@ impl Lowerer {
         program: &Program,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> String {
+        self.lower_statement_list(source.path.clone(), &program.statements, diagnostics)
+    }
+
+    fn lower_statement_list(
+        &mut self,
+        path: PathBuf,
+        statements: &[Statement],
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
         let mut output = String::new();
-        for statement in &program.statements {
-            output.push_str(&self.lower_statement(
-                source.path.clone(),
-                statement.raw_text.as_str(),
-                diagnostics,
-            ));
+        for statement in statements {
+            output.push_str(
+                self.lower_ast_statement(path.clone(), statement, diagnostics)
+                    .as_str(),
+            );
         }
+        output
+    }
+
+    fn lower_ast_statement(
+        &mut self,
+        path: PathBuf,
+        statement: &Statement,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
+        let mut output = match &statement.node {
+            StatementNode::Trivia(text) => text.clone(),
+            StatementNode::Text(text) => match statement.kind {
+                StatementKind::ImportDeclaration
+                | StatementKind::ExportDeclaration
+                | StatementKind::TypeDeclaration => text.clone(),
+                _ => self.lower_statement(path, text, diagnostics),
+            },
+            StatementNode::Local(local) => {
+                self.lower_local_like_statement(path, local.keyword, &local.bindings, local.value.as_deref(), diagnostics)
+            }
+            StatementNode::Return(ret) => match &ret.values {
+                Some(values) => format!(
+                    "return {}",
+                    self.lower_expression_list_with_diagnostics(values.trim(), diagnostics)
+                ),
+                None => "return".to_owned(),
+            },
+            StatementNode::If(if_stmt) => {
+                let mut text = String::new();
+                for clause in &if_stmt.clauses {
+                    let keyword = match clause.keyword {
+                        ConditionalKeyword::If => "if",
+                        ConditionalKeyword::ElseIf => "elseif",
+                    };
+                    writeln!(
+                        text,
+                        "{} {} then",
+                        keyword,
+                        self.lower_expression(clause.condition.trim())
+                    )
+                    .ok();
+                    self.push_scope();
+                    text.push_str(
+                        self.lower_statement_list(path.clone(), &clause.body, diagnostics)
+                            .as_str(),
+                    );
+                    self.pop_scope();
+                }
+                if let Some(body) = &if_stmt.else_body {
+                    text.push_str("else\n");
+                    self.push_scope();
+                    text.push_str(
+                        self.lower_statement_list(path.clone(), body, diagnostics)
+                            .as_str(),
+                    );
+                    self.pop_scope();
+                }
+                text.push_str("end");
+                text
+            }
+            StatementNode::While(while_stmt) => {
+                self.push_scope();
+                let body = self.lower_statement_list(path.clone(), &while_stmt.body, diagnostics);
+                self.pop_scope();
+                format!(
+                    "while {} do\n{}end",
+                    self.lower_expression(while_stmt.condition.trim()),
+                    body
+                )
+            }
+            StatementNode::Repeat(repeat_stmt) => {
+                self.push_scope();
+                let body = self.lower_statement_list(path.clone(), &repeat_stmt.body, diagnostics);
+                self.pop_scope();
+                format!(
+                    "repeat\n{}until {}",
+                    body,
+                    self.lower_expression(repeat_stmt.condition.trim())
+                )
+            }
+            StatementNode::For(for_stmt) => {
+                self.lower_for_from_ast(path, for_stmt.head.as_str(), &for_stmt.body, diagnostics)
+            }
+            StatementNode::Function(function) => {
+                self.lower_function_from_ast(path, function, diagnostics)
+            }
+            StatementNode::Do(block) => {
+                self.push_scope();
+                let body = self.lower_statement_list(path.clone(), &block.body, diagnostics);
+                self.pop_scope();
+                format!("do\n{}end", body)
+            }
+            StatementNode::Switch(switch) => {
+                self.lower_switch_from_ast(path, switch, diagnostics)
+            }
+        };
+        output.push_str(statement.trailing.as_str());
         output
     }
 
@@ -91,6 +199,256 @@ impl Lowerer {
             }
             _ => self.lower_assignment_or_expression(&fragment, diagnostics),
         }
+    }
+
+    fn lower_local_like_statement(
+        &mut self,
+        _path: PathBuf,
+        keyword: LocalKeyword,
+        bindings: &str,
+        value: Option<&str>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
+        if let Some(pattern) = parse_binding_pattern(bindings.trim()) {
+            let mut names = Vec::new();
+            collect_binding_names(&pattern, &mut names);
+            for name in &names {
+                match keyword {
+                    LocalKeyword::Const => self.declare_const(name),
+                    LocalKeyword::Local | LocalKeyword::Let => self.declare_local(name),
+                }
+            }
+
+            let temp = self.next_temp("destructure");
+            let rhs = value.unwrap_or("nil");
+            let mut lines = vec![format!(
+                "local {} = {}",
+                temp,
+                self.lower_expression_list_with_diagnostics(rhs.trim(), diagnostics)
+            )];
+            self.emit_binding_pattern(&pattern, &temp, BindingEmitMode::Local, &mut lines);
+            return lines.join("\n");
+        }
+
+        let names = collect_declared_names(bindings);
+        for name in &names {
+            match keyword {
+                LocalKeyword::Const => self.declare_const(name),
+                LocalKeyword::Local | LocalKeyword::Let => self.declare_local(name),
+            }
+        }
+
+        let lowered_keyword = match keyword {
+            LocalKeyword::Const | LocalKeyword::Let | LocalKeyword::Local => "local",
+        };
+        match value {
+            Some(value) => format!(
+                "{} {} = {}",
+                lowered_keyword,
+                bindings.trim(),
+                self.lower_expression_list_with_diagnostics(value.trim(), diagnostics)
+            ),
+            None => format!("{} {}", lowered_keyword, bindings.trim()),
+        }
+    }
+
+    fn lower_for_from_ast(
+        &mut self,
+        path: PathBuf,
+        head: &str,
+        body: &[Statement],
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
+        if let Some((targets, exprs)) = head.split_once(" in ") {
+            let targets = targets.trim();
+            let exprs = self.lower_expression_list(exprs.trim());
+
+            return match parse_binding_pattern(targets) {
+                Some(pattern) => {
+                    let temp = self.next_temp("iter");
+                    let mut binding_names = Vec::new();
+                    collect_binding_names(&pattern, &mut binding_names);
+                    self.push_scope();
+                    for binding in &binding_names {
+                        self.declare_local(binding);
+                    }
+                    let lowered_body = self.lower_statement_list(path.clone(), body, diagnostics);
+                    self.pop_scope();
+
+                    let mut prologue_lines = Vec::new();
+                    self.emit_binding_pattern(
+                        &pattern,
+                        temp.as_str(),
+                        BindingEmitMode::Local,
+                        &mut prologue_lines,
+                    );
+                    let prologue = prologue_lines.join("\n");
+                    format!(
+                        "for {} in {} do\n{}{}end",
+                        temp,
+                        exprs,
+                        indent_block(prologue.as_str(), "    "),
+                        lowered_body
+                    )
+                }
+                None => {
+                    let loop_bindings = collect_declared_names(targets);
+                    self.push_scope();
+                    for binding in &loop_bindings {
+                        self.declare_local(binding);
+                    }
+                    let lowered_body = self.lower_statement_list(path.clone(), body, diagnostics);
+                    self.pop_scope();
+                    format!("for {} in {} do\n{}end", targets, exprs, lowered_body)
+                }
+            };
+        }
+
+        let loop_bindings = head
+            .split_once('=')
+            .map(|(binding, _)| collect_declared_names(binding))
+            .unwrap_or_default();
+        self.push_scope();
+        for binding in &loop_bindings {
+            self.declare_local(binding);
+        }
+        let lowered_body = self.lower_statement_list(path.clone(), body, diagnostics);
+        self.pop_scope();
+        format!("for {} do\n{}end", self.lower_numeric_for_head(head), lowered_body)
+    }
+
+    fn lower_function_from_ast(
+        &mut self,
+        path: PathBuf,
+        function: &crate::ast::FunctionStatement,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
+        if let Some(name) = local_function_name(function.header_prefix.as_str()) {
+            self.declare_local(name.as_str());
+        }
+
+        let (lowered_params, prologue, param_bindings) =
+            self.lower_function_parameters(function.params.trim());
+        self.push_scope();
+        for binding in &param_bindings {
+            self.declare_local(binding);
+        }
+        let lowered_body = self.lower_statement_list(path, &function.body, diagnostics);
+        self.pop_scope();
+
+        let mut output = String::new();
+        output.push_str(function.header_prefix.as_str());
+        output.push_str(lowered_params.as_str());
+        output.push_str(function.header_suffix.as_str());
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(prologue.as_str());
+        output.push_str(lowered_body.as_str());
+        output.push_str("end");
+        output
+    }
+
+    fn lower_switch_from_ast(
+        &mut self,
+        path: PathBuf,
+        switch: &crate::ast::SwitchStatement,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> String {
+        let switch_value = self.next_temp("switch");
+        let mut output = String::new();
+        writeln!(output, "do").ok();
+        writeln!(
+            output,
+            "    local {} = {}",
+            switch_value,
+            self.lower_expression(switch.expression.as_str())
+        )
+        .ok();
+
+        let mut first_branch = true;
+        let mut default_body = None;
+        let mut pending_labels = Vec::new();
+
+        for section in &switch.sections {
+            match &section.label {
+                AstSwitchLabel::Case(exprs) => {
+                    let section_is_empty = section.body.iter().all(|statement| match &statement.node {
+                        StatementNode::Trivia(text) => text.trim().is_empty(),
+                        StatementNode::Text(text) => text.trim().is_empty(),
+                        _ => false,
+                    });
+                    let section_is_fallthrough = section.body.len() == 1
+                        && matches!(
+                            &section.body[0].node,
+                            StatementNode::Text(text) if text.trim() == "fallthrough"
+                        );
+
+                    if section_is_empty || section_is_fallthrough {
+                        pending_labels.extend(exprs.iter().cloned());
+                        continue;
+                    }
+
+                    let mut all_exprs = pending_labels.clone();
+                    all_exprs.extend(exprs.iter().cloned());
+                    pending_labels.clear();
+
+                    let lowered_conditions = all_exprs
+                        .iter()
+                        .map(|expr| format!("{} == {}", switch_value, self.lower_expression(expr.trim())))
+                        .collect::<Vec<_>>()
+                        .join(" or ");
+
+                    self.push_scope();
+                    let lowered_body = indent_block(
+                        self.lower_statement_list(path.clone(), &section.body, diagnostics)
+                            .as_str(),
+                        "    ",
+                    );
+                    self.pop_scope();
+
+                    if first_branch {
+                        writeln!(output, "    if {} then", lowered_conditions).ok();
+                        first_branch = false;
+                    } else {
+                        writeln!(output, "    elseif {} then", lowered_conditions).ok();
+                    }
+                    output.push_str(lowered_body.as_str());
+                }
+                AstSwitchLabel::Default => {
+                    self.push_scope();
+                    default_body = Some(indent_block(
+                        self.lower_statement_list(path.clone(), &section.body, diagnostics)
+                            .as_str(),
+                        "    ",
+                    ));
+                    self.pop_scope();
+                }
+            }
+        }
+
+        if first_branch {
+            diagnostics.push(Diagnostic::warning(
+                Some(&path),
+                Some(Span::new(0, switch.expression.len())),
+                "switch statement has no case clauses",
+            ));
+            output.push_str("    -- empty switch\n");
+        } else if let Some(default_body) = default_body {
+            output.push_str("    else\n");
+            output.push_str(default_body.as_str());
+            output.push_str("    end\n");
+        } else {
+            diagnostics.push(Diagnostic::warning(
+                Some(&path),
+                Some(Span::new(0, switch.expression.len())),
+                "switch statement has no default branch; exhaustiveness cannot be guaranteed",
+            ));
+            output.push_str("    end\n");
+        }
+
+        output.push_str("end");
+        output
     }
 
     fn lower_nested_block(
@@ -2028,6 +2386,47 @@ fn collect_binding_names(pattern: &BindingPattern, names: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+fn collect_declared_names(bindings: &str) -> Vec<String> {
+    if let Some(pattern) = parse_binding_pattern(bindings.trim()) {
+        let mut names = Vec::new();
+        collect_binding_names(&pattern, &mut names);
+        return names;
+    }
+
+    split_top_level(bindings, ',')
+        .into_iter()
+        .filter_map(|part| {
+            let binding = part.trim();
+            if binding.is_empty() {
+                return None;
+            }
+            let name = split_top_level_once(binding, ':')
+                .map(|(name, _)| name)
+                .unwrap_or_else(|| binding.to_owned());
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        })
+        .collect()
+}
+
+fn local_function_name(header_prefix: &str) -> Option<String> {
+    let trimmed = header_prefix.trim_start();
+    let remainder = trimmed.strip_prefix("local function")?.trim_start();
+    let mut name = String::new();
+    for ch in remainder.chars() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            name.push(ch);
+        } else {
+            break;
+        }
+    }
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn split_top_level(text: &str, separator: char) -> Vec<String> {

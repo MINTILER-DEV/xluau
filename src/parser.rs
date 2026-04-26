@@ -1,6 +1,11 @@
-use crate::ast::{Program, Statement, StatementKind};
+use crate::ast::{
+    BlockStatement, ConditionalClause, ConditionalKeyword, ForStatement, FunctionStatement,
+    IfStatement, LocalKeyword, LocalStatement, Program, RepeatStatement, ReturnStatement,
+    Statement, StatementKind, StatementNode, SwitchLabel, SwitchSection, SwitchStatement,
+    WhileStatement,
+};
 use crate::diagnostic::{Diagnostic, Span};
-use crate::lexer::{Keyword, Symbol, Token, TokenKind};
+use crate::lexer::{Keyword, Lexer, Symbol, Token, TokenKind};
 use crate::source::SourceFile;
 
 #[derive(Debug)]
@@ -17,14 +22,24 @@ impl<'a> Parser<'a> {
     pub fn parse(&self, diagnostics: &mut Vec<Diagnostic>) -> Program {
         self.validate_delimiters(diagnostics);
 
+        let statements = self.collect_statements(0, self.tokens.len());
+
+        Program {
+            source_kind: self.source.kind,
+            span: Span::new(0, self.source.text.len()),
+            statements,
+        }
+    }
+
+    fn collect_statements(&self, start: usize, end: usize) -> Vec<Statement> {
         let mut statements = Vec::new();
-        let mut start = 0usize;
+        let mut statement_start = start;
         let mut paren_depth = 0usize;
         let mut brace_depth = 0usize;
         let mut bracket_depth = 0usize;
         let mut block_depth = 0usize;
 
-        for (index, token) in self.tokens.iter().enumerate() {
+        for (index, token) in self.tokens.iter().enumerate().skip(start).take(end - start) {
             match token.kind {
                 TokenKind::Symbol(Symbol::LeftParen) => paren_depth += 1,
                 TokenKind::Symbol(Symbol::RightParen) => {
@@ -62,24 +77,20 @@ impl<'a> Parser<'a> {
                 );
 
             if is_boundary {
-                let end = if matches!(token.kind, TokenKind::Eof) {
+                let statement_end = if matches!(token.kind, TokenKind::Eof) {
                     index
                 } else {
                     index + 1
                 };
 
-                if let Some(statement) = self.make_statement(start, end) {
+                if let Some(statement) = self.make_statement(statement_start, statement_end) {
                     statements.push(statement);
                 }
-                start = index + 1;
+                statement_start = index + 1;
             }
         }
 
-        Program {
-            source_kind: self.source.kind,
-            span: Span::new(0, self.source.text.len()),
-            statements,
-        }
+        statements
     }
 
     fn validate_delimiters(&self, diagnostics: &mut Vec<Diagnostic>) {
@@ -148,19 +159,314 @@ impl<'a> Parser<'a> {
             return None;
         }
 
-        let raw_text = slice
+        let full_text = slice
             .iter()
             .map(|token| token.lexeme.as_str())
             .collect::<String>();
+        let (body_text, trailing) = split_statement_suffix(slice, &full_text);
         let span = Span::new(slice.first()?.span.start, slice.last()?.span.end);
         let kind = classify_statement(slice);
+        let node = self.parse_statement_node(kind, body_text.as_str());
 
         Some(Statement {
             kind,
-            raw_text,
+            node,
+            trailing,
             span,
         })
     }
+
+    fn parse_statement_node(&self, kind: StatementKind, text: &str) -> StatementNode {
+        if matches!(kind, StatementKind::Comment | StatementKind::Whitespace) {
+            return StatementNode::Trivia(text.to_owned());
+        }
+
+        let fragment = Fragment::new(self.source, text);
+        let Some(first) = fragment.first_significant_index() else {
+            return StatementNode::Trivia(text.to_owned());
+        };
+
+        match fragment.tokens[first].kind {
+            TokenKind::Keyword(Keyword::Const) => self.parse_local_statement(text, LocalKeyword::Const),
+            TokenKind::Keyword(Keyword::Let) => self.parse_local_statement(text, LocalKeyword::Let),
+            TokenKind::Keyword(Keyword::Local) => {
+                if let Some(next) = fragment.next_significant_after(first) {
+                    if fragment.tokens[next].kind == TokenKind::Keyword(Keyword::Function) {
+                        return self.parse_function_statement(text);
+                    }
+                }
+                self.parse_local_statement(text, LocalKeyword::Local)
+            }
+            TokenKind::Keyword(Keyword::Return) => self.parse_return_statement(text),
+            TokenKind::Keyword(Keyword::If) => self.parse_if_statement(text),
+            TokenKind::Keyword(Keyword::While) => self.parse_while_statement(text),
+            TokenKind::Keyword(Keyword::Repeat) => self.parse_repeat_statement(text),
+            TokenKind::Keyword(Keyword::For) => self.parse_for_statement(text),
+            TokenKind::Keyword(Keyword::Function) => self.parse_function_statement(text),
+            TokenKind::Keyword(Keyword::Do) => self.parse_do_statement(text),
+            TokenKind::Keyword(Keyword::Switch) => self.parse_switch_statement(text),
+            _ => StatementNode::Text(text.to_owned()),
+        }
+    }
+
+    fn parse_local_statement(&self, text: &str, keyword: LocalKeyword) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let first = fragment.first_significant_index().unwrap_or(0);
+        let next = fragment.next_significant_after(first).unwrap_or(fragment.tokens.len());
+
+        let (bindings, value) = if let Some(assign_index) = fragment.find_top_level_symbol(Symbol::Assign)
+        {
+            (
+                fragment.slice_between_tokens(next, assign_index).trim().to_owned(),
+                Some(
+                    fragment
+                        .slice_between_tokens(assign_index + 1, fragment.tokens.len() - 1)
+                        .trim()
+                        .to_owned(),
+                ),
+            )
+        } else {
+            (
+                fragment
+                    .slice_between_tokens(next, fragment.tokens.len() - 1)
+                    .trim()
+                    .to_owned(),
+                None,
+            )
+        };
+
+        StatementNode::Local(LocalStatement {
+            keyword,
+            bindings,
+            value,
+        })
+    }
+
+    fn parse_return_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let first = fragment.first_significant_index().unwrap_or(0);
+        let values = fragment
+            .slice_between_tokens(first + 1, fragment.tokens.len() - 1)
+            .trim()
+            .to_owned();
+
+        StatementNode::Return(ReturnStatement {
+            values: if values.is_empty() { None } else { Some(values) },
+        })
+    }
+
+    fn parse_if_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let mut clauses = Vec::new();
+        let mut else_body = None;
+        let mut cursor = 0usize;
+
+        while cursor < tokens.len() {
+            match tokens[cursor].kind {
+                TokenKind::Keyword(Keyword::If) | TokenKind::Keyword(Keyword::ElseIf) => {
+                    let keyword = if matches!(tokens[cursor].kind, TokenKind::Keyword(Keyword::If)) {
+                        ConditionalKeyword::If
+                    } else {
+                        ConditionalKeyword::ElseIf
+                    };
+                    let then_index = fragment
+                        .find_top_level_keyword_between(&tokens, cursor + 1, Keyword::Then)
+                        .expect("if clause should contain then");
+                    let cond = fragment
+                        .text_between(tokens[cursor].span.end, tokens[then_index].span.start)
+                        .trim()
+                        .to_owned();
+                    let body_end = fragment
+                        .find_next_clause_boundary(&tokens, then_index + 1)
+                        .unwrap_or(tokens.len() - 1);
+                    let body_text = fragment
+                        .text_between(tokens[then_index].span.end, tokens[body_end].span.start);
+                    clauses.push(ConditionalClause {
+                        keyword,
+                        condition: cond,
+                        body: self.parse_nested_statements(body_text),
+                    });
+                    cursor = body_end;
+                }
+                TokenKind::Keyword(Keyword::Else) => {
+                    let body_end = tokens.len() - 1;
+                    let body_text =
+                        fragment.text_between(tokens[cursor].span.end, tokens[body_end].span.start);
+                    else_body = Some(self.parse_nested_statements(body_text));
+                    cursor = body_end;
+                }
+                TokenKind::Keyword(Keyword::End) => break,
+                _ => cursor += 1,
+            }
+        }
+
+        StatementNode::If(IfStatement { clauses, else_body })
+    }
+
+    fn parse_while_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let do_index = fragment
+            .find_top_level_keyword_between(&tokens, 1, Keyword::Do)
+            .expect("while should contain do");
+        let condition = fragment
+            .text_between(tokens[0].span.end, tokens[do_index].span.start)
+            .trim()
+            .to_owned();
+        let body_text = fragment.text_between(
+            tokens[do_index].span.end,
+            tokens[tokens.len() - 1].span.start,
+        );
+
+        StatementNode::While(WhileStatement {
+            condition,
+            body: self.parse_nested_statements(body_text),
+        })
+    }
+
+    fn parse_repeat_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let until_index = tokens
+            .iter()
+            .position(|token| token.kind == TokenKind::Keyword(Keyword::Until))
+            .expect("repeat should contain until");
+        let body_text = fragment.text_between(tokens[0].span.end, tokens[until_index].span.start);
+        let condition = fragment
+            .text_between(tokens[until_index].span.end, text.len())
+            .trim()
+            .to_owned();
+
+        StatementNode::Repeat(RepeatStatement {
+            body: self.parse_nested_statements(body_text),
+            condition,
+        })
+    }
+
+    fn parse_for_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let do_index = fragment
+            .find_top_level_keyword_between(&tokens, 1, Keyword::Do)
+            .expect("for should contain do");
+        let head = fragment
+            .text_between(tokens[0].span.end, tokens[do_index].span.start)
+            .trim()
+            .to_owned();
+        let body_text = fragment.text_between(
+            tokens[do_index].span.end,
+            tokens[tokens.len() - 1].span.start,
+        );
+
+        StatementNode::For(ForStatement {
+            head,
+            body: self.parse_nested_statements(body_text),
+        })
+    }
+
+    fn parse_function_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let open_paren_index = tokens
+            .iter()
+            .position(|token| token.kind == TokenKind::Symbol(Symbol::LeftParen))
+            .expect("function should contain opening paren");
+        let close_paren_index = fragment.matching_paren(&tokens, open_paren_index);
+        let end_index = tokens.len() - 1;
+        let params = fragment
+            .text_between(
+                tokens[open_paren_index].span.end,
+                tokens[close_paren_index].span.start,
+            )
+            .trim()
+            .to_owned();
+        let mut body_start = tokens[close_paren_index].span.end;
+        if let Some(newline) = fragment.tokens.iter().find(|token| {
+            matches!(token.kind, TokenKind::Newline)
+                && token.span.start >= tokens[close_paren_index].span.end
+        }) {
+            body_start = newline.span.end;
+        }
+
+        let body_text = fragment.text_between(body_start, tokens[end_index].span.start);
+        let header_prefix = fragment.text_between(0, tokens[open_paren_index].span.end);
+        let header_suffix =
+            fragment.text_between(tokens[close_paren_index].span.start, body_start);
+
+        StatementNode::Function(FunctionStatement {
+            header_prefix,
+            params,
+            header_suffix,
+            body: self.parse_nested_statements(body_text),
+        })
+    }
+
+    fn parse_do_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let body_text =
+            fragment.text_between(tokens[0].span.end, tokens[tokens.len() - 1].span.start);
+
+        StatementNode::Do(BlockStatement {
+            body: self.parse_nested_statements(body_text),
+        })
+    }
+
+    fn parse_switch_statement(&self, text: &str) -> StatementNode {
+        let fragment = Fragment::new(self.source, text);
+        let tokens = fragment.significant_tokens();
+        let expression = fragment
+            .text_between(
+                tokens[0].span.end,
+                fragment
+                    .first_body_newline(&tokens)
+                    .unwrap_or(tokens[1].span.start),
+            )
+            .trim()
+            .to_owned();
+        let mut sections = Vec::new();
+
+        for section in fragment.switch_sections(&tokens) {
+            let label = match section.label {
+                FragmentSwitchLabel::Case(values) => SwitchLabel::Case(values),
+                FragmentSwitchLabel::Default => SwitchLabel::Default,
+            };
+            sections.push(SwitchSection {
+                label,
+                body: self.parse_nested_statements(section.body),
+            });
+        }
+
+        StatementNode::Switch(SwitchStatement { expression, sections })
+    }
+
+    fn parse_nested_statements(&self, text: String) -> Vec<Statement> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let nested_source =
+            SourceFile::virtual_file(self.source.path.clone(), self.source.kind, text);
+        let nested_tokens = Lexer::new(&nested_source).lex(&mut Vec::new());
+        Parser::new(&nested_source, &nested_tokens)
+            .parse(&mut Vec::new())
+            .statements
+    }
+}
+
+fn split_statement_suffix(tokens: &[Token], text: &str) -> (String, String) {
+    if let Some(last) = tokens.last() {
+        match last.kind {
+            TokenKind::Newline | TokenKind::Symbol(Symbol::Semicolon) => {
+                let split_at = text.len().saturating_sub(last.lexeme.len());
+                return (text[..split_at].to_owned(), text[split_at..].to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    (text.to_owned(), String::new())
 }
 
 fn classify_statement(tokens: &[Token]) -> StatementKind {
@@ -244,12 +550,303 @@ fn symbol_text(symbol: Symbol) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct Fragment {
+    text: String,
+    tokens: Vec<Token>,
+}
+
+impl Fragment {
+    fn new(source: &SourceFile, text: &str) -> Self {
+        let fragment_source = SourceFile::virtual_file(source.path.clone(), source.kind, text.to_owned());
+        let tokens = Lexer::new(&fragment_source).lex(&mut Vec::new());
+        Self {
+            text: text.to_owned(),
+            tokens,
+        }
+    }
+
+    fn significant_tokens(&self) -> Vec<Token> {
+        self.tokens
+            .iter()
+            .filter(|token| !token.is_trivia() && token.kind != TokenKind::Eof)
+            .cloned()
+            .collect()
+    }
+
+    fn first_significant_index(&self) -> Option<usize> {
+        self.tokens
+            .iter()
+            .position(|token| !token.is_trivia() && token.kind != TokenKind::Eof)
+    }
+
+    fn next_significant_after(&self, index: usize) -> Option<usize> {
+        self.tokens
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find(|(_, token)| !token.is_trivia() && token.kind != TokenKind::Eof)
+            .map(|(index, _)| index)
+    }
+
+    fn slice_between_tokens(&self, start: usize, end_exclusive: usize) -> String {
+        let Some(first) = self.tokens.get(start) else {
+            return String::new();
+        };
+        if end_exclusive <= start {
+            return String::new();
+        }
+        let last = &self.tokens[end_exclusive - 1];
+        self.text[first.span.start..last.span.end].to_owned()
+    }
+
+    fn text_between(&self, start: usize, end: usize) -> String {
+        if start >= end || end > self.text.len() {
+            return String::new();
+        }
+        self.text[start..end].to_owned()
+    }
+
+    fn find_top_level_symbol(&self, symbol: Symbol) -> Option<usize> {
+        let mut paren = 0usize;
+        let mut brace = 0usize;
+        let mut bracket = 0usize;
+        for (index, token) in self.tokens.iter().enumerate() {
+            match token.kind {
+                TokenKind::Symbol(Symbol::LeftParen) => paren += 1,
+                TokenKind::Symbol(Symbol::RightParen) => paren = paren.saturating_sub(1),
+                TokenKind::Symbol(Symbol::LeftBrace) => brace += 1,
+                TokenKind::Symbol(Symbol::RightBrace) => brace = brace.saturating_sub(1),
+                TokenKind::Symbol(Symbol::LeftBracket) => bracket += 1,
+                TokenKind::Symbol(Symbol::RightBracket) => bracket = bracket.saturating_sub(1),
+                TokenKind::Symbol(found)
+                    if found == symbol && paren == 0 && brace == 0 && bracket == 0 =>
+                {
+                    return Some(index);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn find_top_level_keyword_between(
+        &self,
+        tokens: &[Token],
+        start: usize,
+        keyword: Keyword,
+    ) -> Option<usize> {
+        let mut paren = 0usize;
+        let mut brace = 0usize;
+        let mut bracket = 0usize;
+        let mut blocks = 0usize;
+
+        for (index, token) in tokens.iter().enumerate().skip(start) {
+            match token.kind {
+                TokenKind::Symbol(Symbol::LeftParen) => paren += 1,
+                TokenKind::Symbol(Symbol::RightParen) => paren = paren.saturating_sub(1),
+                TokenKind::Symbol(Symbol::LeftBrace) => brace += 1,
+                TokenKind::Symbol(Symbol::RightBrace) => brace = brace.saturating_sub(1),
+                TokenKind::Symbol(Symbol::LeftBracket) => bracket += 1,
+                TokenKind::Symbol(Symbol::RightBracket) => bracket = bracket.saturating_sub(1),
+                TokenKind::Keyword(Keyword::Function)
+                | TokenKind::Keyword(Keyword::If)
+                | TokenKind::Keyword(Keyword::For)
+                | TokenKind::Keyword(Keyword::While)
+                | TokenKind::Keyword(Keyword::Repeat)
+                | TokenKind::Keyword(Keyword::Switch) => blocks += 1,
+                TokenKind::Keyword(Keyword::End) | TokenKind::Keyword(Keyword::Until) => {
+                    blocks = blocks.saturating_sub(1)
+                }
+                TokenKind::Keyword(found)
+                    if found == keyword
+                        && paren == 0
+                        && brace == 0
+                        && bracket == 0
+                        && blocks == 0 =>
+                {
+                    return Some(index);
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn find_next_clause_boundary(&self, tokens: &[Token], start: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (index, token) in tokens.iter().enumerate().skip(start) {
+            match token.kind {
+                TokenKind::Keyword(Keyword::If)
+                | TokenKind::Keyword(Keyword::Function)
+                | TokenKind::Keyword(Keyword::For)
+                | TokenKind::Keyword(Keyword::While)
+                | TokenKind::Keyword(Keyword::Repeat)
+                | TokenKind::Keyword(Keyword::Switch) => depth += 1,
+                TokenKind::Keyword(Keyword::End) | TokenKind::Keyword(Keyword::Until) => {
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Keyword(Keyword::ElseIf) | TokenKind::Keyword(Keyword::Else)
+                    if depth == 0 =>
+                {
+                    return Some(index);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn matching_paren(&self, tokens: &[Token], start: usize) -> usize {
+        let mut depth = 0usize;
+        for (index, token) in tokens.iter().enumerate().skip(start) {
+            match token.kind {
+                TokenKind::Symbol(Symbol::LeftParen) => depth += 1,
+                TokenKind::Symbol(Symbol::RightParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return index;
+                    }
+                }
+                _ => {}
+            }
+        }
+        start
+    }
+
+    fn first_body_newline(&self, tokens: &[Token]) -> Option<usize> {
+        self.tokens
+            .iter()
+            .find(|token| {
+                matches!(token.kind, TokenKind::Newline) && token.span.start >= tokens[0].span.end
+            })
+            .map(|token| token.span.start)
+    }
+
+    fn switch_sections(&self, tokens: &[Token]) -> Vec<FragmentSwitchSection> {
+        let mut sections = Vec::new();
+        let body_start = self
+            .first_body_newline(tokens)
+            .unwrap_or(tokens[1].span.start);
+        let body_tokens = tokens
+            .iter()
+            .filter(|token| token.span.start >= body_start)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut cursor = 0usize;
+
+        while cursor < body_tokens.len() {
+            match body_tokens[cursor].kind {
+                TokenKind::Keyword(Keyword::Case) => {
+                    let label_end = self
+                        .find_case_colon(&body_tokens, cursor + 1)
+                        .unwrap_or(cursor + 1);
+                    let body_end = self
+                        .find_next_switch_boundary(&body_tokens, label_end + 1)
+                        .unwrap_or(body_tokens.len() - 1);
+                    let labels = self
+                        .text_between(
+                            body_tokens[cursor].span.end,
+                            body_tokens[label_end].span.start,
+                        )
+                        .split(',')
+                        .map(|expr| expr.trim().to_owned())
+                        .filter(|expr| !expr.is_empty())
+                        .collect::<Vec<_>>();
+                    let body = self.text_between(
+                        body_tokens[label_end].span.end,
+                        body_tokens[body_end].span.start,
+                    );
+                    sections.push(FragmentSwitchSection {
+                        label: FragmentSwitchLabel::Case(labels),
+                        body,
+                    });
+                    cursor = body_end;
+                }
+                TokenKind::Keyword(Keyword::Default) => {
+                    let label_end = self
+                        .find_case_colon(&body_tokens, cursor + 1)
+                        .unwrap_or(cursor);
+                    let body_end = self
+                        .find_next_switch_boundary(&body_tokens, label_end + 1)
+                        .unwrap_or(body_tokens.len() - 1);
+                    let body = self.text_between(
+                        body_tokens[label_end].span.end,
+                        body_tokens[body_end].span.start,
+                    );
+                    sections.push(FragmentSwitchSection {
+                        label: FragmentSwitchLabel::Default,
+                        body,
+                    });
+                    cursor = body_end;
+                }
+                TokenKind::Keyword(Keyword::End) => break,
+                _ => cursor += 1,
+            }
+        }
+
+        sections
+    }
+
+    fn find_case_colon(&self, tokens: &[Token], start: usize) -> Option<usize> {
+        tokens
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, token)| token.kind == TokenKind::Symbol(Symbol::Colon))
+            .map(|(index, _)| index)
+    }
+
+    fn find_next_switch_boundary(&self, tokens: &[Token], start: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (index, token) in tokens.iter().enumerate().skip(start) {
+            match token.kind {
+                TokenKind::Keyword(Keyword::If)
+                | TokenKind::Keyword(Keyword::Function)
+                | TokenKind::Keyword(Keyword::For)
+                | TokenKind::Keyword(Keyword::While)
+                | TokenKind::Keyword(Keyword::Repeat)
+                | TokenKind::Keyword(Keyword::Switch) => depth += 1,
+                TokenKind::Keyword(Keyword::End) | TokenKind::Keyword(Keyword::Until) => {
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Keyword(Keyword::Case) | TokenKind::Keyword(Keyword::Default)
+                    if depth == 0 =>
+                {
+                    return Some(index);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
+struct FragmentSwitchSection {
+    label: FragmentSwitchLabel,
+    body: String,
+}
+
+#[derive(Debug)]
+enum FragmentSwitchLabel {
+    Case(Vec<String>),
+    Default,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::Parser;
-    use crate::ast::StatementKind;
+    use crate::ast::{StatementKind, StatementNode, SwitchLabel};
     use crate::lexer::Lexer;
     use crate::source::{SourceFile, SourceKind};
 
@@ -268,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_keeps_function_block_as_single_statement() {
+    fn parser_builds_recursive_function_body() {
         let source = SourceFile {
             path: PathBuf::from("test.xl"),
             kind: SourceKind::XLuau,
@@ -279,6 +876,34 @@ mod tests {
         let program = Parser::new(&source, &tokens).parse(&mut Vec::new());
 
         assert_eq!(program.statements.len(), 2);
-        assert!(program.statements[0].raw_text.contains("return value"));
+        match &program.statements[0].node {
+            StatementNode::Function(function) => {
+                assert_eq!(function.body.len(), 2);
+                assert!(matches!(function.body[0].node, StatementNode::Local(_)));
+                assert!(matches!(function.body[1].node, StatementNode::Return(_)));
+            }
+            other => panic!("expected function node, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_builds_switch_sections() {
+        let source = SourceFile {
+            path: PathBuf::from("test.xl"),
+            kind: SourceKind::XLuau,
+            text: "switch value\ncase 1, 2:\n    print(\"hit\")\ndefault:\n    print(\"miss\")\nend\n"
+                .to_owned(),
+        };
+        let tokens = Lexer::new(&source).lex(&mut Vec::new());
+        let program = Parser::new(&source, &tokens).parse(&mut Vec::new());
+
+        match &program.statements[0].node {
+            StatementNode::Switch(switch) => {
+                assert_eq!(switch.sections.len(), 2);
+                assert!(matches!(&switch.sections[0].label, SwitchLabel::Case(values) if values == &vec!["1".to_owned(), "2".to_owned()]));
+                assert!(matches!(switch.sections[1].label, SwitchLabel::Default));
+            }
+            other => panic!("expected switch node, found {other:?}"),
+        }
     }
 }
