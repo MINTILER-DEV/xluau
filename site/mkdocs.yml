@@ -44,10 +44,18 @@ extra_css:
   - stylesheets/extra.css
 
 nav:
-  - Overview: intro.md
+  - Start Here: intro.md
+  - Quickstart: quickstart.md
+  - Language Tour: language-tour.md
   - Getting Started: getting-started.md
-  - Architecture: architecture.md
-  - Roadmap Status: roadmap-status.md
+  - Guides:
+      - Modules: guides/modules.md
+      - Types: guides/types.md
+      - Classes and Decorators: guides/classes-and-decorators.md
+      - Migrating from Luau: guides/migrating-from-luau.md
+  - Reference:
+      - Architecture: architecture.md
+      - Roadmap Status: roadmap-status.md
   - Phases:
       - Phase 1 - Core Infrastructure: phases/phase-1-core-infrastructure.md
       - Phase 2 - High-Impact Syntax: phases/phase-2-high-impact-syntax.md
