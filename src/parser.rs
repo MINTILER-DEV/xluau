@@ -43,7 +43,6 @@ impl<'a> Parser<'a> {
                     | Keyword::If
                     | Keyword::For
                     | Keyword::While
-                    | Keyword::Do
                     | Keyword::Repeat
                     | Keyword::Switch => block_depth += 1,
                     Keyword::End | Keyword::Until => {

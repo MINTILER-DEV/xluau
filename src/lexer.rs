@@ -29,6 +29,7 @@ pub enum TokenKind {
 pub enum Keyword {
     And,
     Break,
+    Case,
     Class,
     Const,
     Continue,
@@ -466,6 +467,7 @@ fn keyword_for(lexeme: &str) -> Option<Keyword> {
     Some(match lexeme {
         "and" => Keyword::And,
         "break" => Keyword::Break,
+        "case" => Keyword::Case,
         "class" => Keyword::Class,
         "const" => Keyword::Const,
         "continue" => Keyword::Continue,
