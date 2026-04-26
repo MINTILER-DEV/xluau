@@ -132,7 +132,7 @@ impl Compiler {
         for requested in requested_paths {
             let path = self.resolve_requested_path(requested);
             if path.is_file() {
-                self.push_if_supported(&path, &mut files)?;
+                self.push_explicit_file(&path, &mut files)?;
                 continue;
             }
 
@@ -140,7 +140,7 @@ impl Compiler {
                 for entry in WalkDir::new(&path) {
                     let entry = entry?;
                     if entry.file_type().is_file() {
-                        self.push_if_supported(entry.path(), &mut files)?;
+                        self.push_if_supported(entry.path(), &mut files);
                     }
                 }
                 continue;
@@ -192,7 +192,7 @@ impl Compiler {
         }
     }
 
-    fn push_if_supported(&self, path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    fn push_explicit_file(&self, path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         if self.is_supported_extension(path) {
             files.push(path.to_path_buf());
             Ok(())
@@ -201,6 +201,12 @@ impl Compiler {
                 "unsupported input file extension: {}",
                 path.display()
             )))
+        }
+    }
+
+    fn push_if_supported(&self, path: &Path, files: &mut Vec<PathBuf>) {
+        if self.is_supported_extension(path) {
+            files.push(path.to_path_buf());
         }
     }
 
@@ -265,6 +271,7 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
@@ -288,5 +295,21 @@ mod tests {
         assert_eq!(summary.checked_files, 1);
         let emitted = fs::read_to_string(temp.path().join("out/init.luau")).expect("output");
         assert_eq!(emitted, "local answer = 42\nprint(answer)\n");
+    }
+
+    #[test]
+    fn explicit_directory_inputs_ignore_non_xluau_files() {
+        let temp = tempdir().expect("tempdir");
+        fs::create_dir_all(temp.path().join("workspace")).expect("workspace dir");
+        fs::write(temp.path().join("workspace/main.xl"), "print('ok')").expect("xl file");
+        fs::write(temp.path().join("workspace/readme.txt"), "ignored").expect("text file");
+
+        let compiler =
+            Compiler::new(temp.path().to_path_buf(), XLuauConfig::default()).expect("compiler");
+        let summary = compiler
+            .check(&[PathBuf::from("workspace")])
+            .expect("directory check");
+
+        assert_eq!(summary.checked_files, 1);
     }
 }
