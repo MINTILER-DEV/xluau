@@ -1147,6 +1147,19 @@ impl Lowerer {
         match expr {
             Expr::Raw(text) | Expr::Literal(text) | Expr::Name(text) => text.clone(),
             Expr::Group(inner) => format!("({})", self.render_expression(inner)),
+            Expr::TypedCall {
+                callee,
+                type_args,
+                args,
+            } => format!(
+                "{}<{}>({})",
+                self.render_expression(callee),
+                type_args,
+                args.iter()
+                    .map(|arg| self.render_expression(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Expr::Unary { op, expr } => format!("({}{})", op, self.render_expression(expr)),
             Expr::Binary { left, op, right } => format!(
                 "({} {} {})",
@@ -1242,6 +1255,20 @@ impl Lowerer {
                 "{}:{}({})",
                 base,
                 name,
+                args.iter()
+                    .map(|arg| self.render_expression(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ChainSegment::TypedMethodCall {
+                name,
+                type_args,
+                args,
+            } => format!(
+                "{}:{}<{}>({})",
+                base,
+                name,
+                type_args,
                 args.iter()
                     .map(|arg| self.render_expression(arg))
                     .collect::<Vec<_>>()
@@ -1898,6 +1925,11 @@ enum Expr {
     Literal(String),
     Name(String),
     Group(Box<Expr>),
+    TypedCall {
+        callee: Box<Expr>,
+        type_args: String,
+        args: Vec<Expr>,
+    },
     Unary {
         op: String,
         expr: Box<Expr>,
@@ -1932,6 +1964,11 @@ enum ChainSegment {
     Index { expr: Box<Expr>, optional: bool },
     Call { args: Vec<Expr>, optional: bool },
     MethodCall { name: String, args: Vec<Expr> },
+    TypedMethodCall {
+        name: String,
+        type_args: String,
+        args: Vec<Expr>,
+    },
 }
 
 impl ChainSegment {
@@ -1940,7 +1977,7 @@ impl ChainSegment {
             ChainSegment::Member { optional, .. }
             | ChainSegment::Index { optional, .. }
             | ChainSegment::Call { optional, .. } => *optional,
-            ChainSegment::MethodCall { .. } => false,
+            ChainSegment::MethodCall { .. } | ChainSegment::TypedMethodCall { .. } => false,
         }
     }
 
@@ -1960,6 +1997,15 @@ impl ChainSegment {
             },
             ChainSegment::MethodCall { name, args } => Self::MethodCall {
                 name: name.clone(),
+                args: args.clone(),
+            },
+            ChainSegment::TypedMethodCall {
+                name,
+                type_args,
+                args,
+            } => Self::TypedMethodCall {
+                name: name.clone(),
+                type_args: type_args.clone(),
                 args: args.clone(),
             },
         }
@@ -2063,7 +2109,7 @@ impl ExprParser {
     }
 
     fn parse_postfix(&mut self, base: Expr) -> Expr {
-        let expr = base;
+        let mut expr = base;
         let mut segments = Vec::new();
 
         loop {
@@ -2071,6 +2117,19 @@ impl ExprParser {
                 break;
             };
             match token.kind {
+                TokenKind::Symbol(Symbol::Less) => {
+                    let Some(type_args) = self.try_parse_type_args_text() else {
+                        break;
+                    };
+                    self.consume_symbol(Symbol::LeftParen);
+                    let args = self.parse_argument_list();
+                    self.consume_symbol(Symbol::RightParen);
+                    expr = Expr::TypedCall {
+                        callee: Box::new(finalize_chain(expr, &mut segments)),
+                        type_args,
+                        args,
+                    };
+                }
                 TokenKind::Symbol(Symbol::Dot) => {
                     self.advance();
                     if let Some(name) = self.advance() {
@@ -2128,6 +2187,17 @@ impl ExprParser {
                     let Some(name) = self.advance() else {
                         break;
                     };
+                    if let Some(type_args) = self.try_parse_type_args_text() {
+                        self.consume_symbol(Symbol::LeftParen);
+                        let args = self.parse_argument_list();
+                        self.consume_symbol(Symbol::RightParen);
+                        segments.push(ChainSegment::TypedMethodCall {
+                            name: name.lexeme,
+                            type_args,
+                            args,
+                        });
+                        continue;
+                    }
                     self.consume_symbol(Symbol::LeftParen);
                     let args = self.parse_argument_list();
                     self.consume_symbol(Symbol::RightParen);
@@ -2148,6 +2218,57 @@ impl ExprParser {
                 segments,
             }
         }
+    }
+
+    fn try_parse_type_args_text(&mut self) -> Option<String> {
+        if !self.peek_kind(TokenKind::Symbol(Symbol::Less)) {
+            return None;
+        }
+
+        let end = self.find_matching_type_arg_end(self.cursor)?;
+        if !matches!(
+            self.tokens.get(end + 1).map(|token| &token.kind),
+            Some(TokenKind::Symbol(Symbol::LeftParen))
+        ) {
+            return None;
+        }
+
+        let type_args = self.tokens[self.cursor + 1..end]
+            .iter()
+            .map(|token| token.lexeme.as_str())
+            .collect::<String>();
+        self.cursor = end + 1;
+        Some(type_args)
+    }
+
+    fn find_matching_type_arg_end(&self, start: usize) -> Option<usize> {
+        let mut angle = 0usize;
+        let mut paren = 0usize;
+        let mut brace = 0usize;
+        let mut bracket = 0usize;
+
+        for (index, token) in self.tokens.iter().enumerate().skip(start) {
+            match token.kind {
+                TokenKind::Symbol(Symbol::Less) => angle += 1,
+                TokenKind::Symbol(Symbol::Greater) => {
+                    if paren == 0 && brace == 0 && bracket == 0 {
+                        angle = angle.saturating_sub(1);
+                        if angle == 0 {
+                            return Some(index);
+                        }
+                    }
+                }
+                TokenKind::Symbol(Symbol::LeftParen) => paren += 1,
+                TokenKind::Symbol(Symbol::RightParen) => paren = paren.saturating_sub(1),
+                TokenKind::Symbol(Symbol::LeftBrace) => brace += 1,
+                TokenKind::Symbol(Symbol::RightBrace) => brace = brace.saturating_sub(1),
+                TokenKind::Symbol(Symbol::LeftBracket) => bracket += 1,
+                TokenKind::Symbol(Symbol::RightBracket) => bracket = bracket.saturating_sub(1),
+                _ => {}
+            }
+        }
+
+        None
     }
 
     fn parse_argument_list(&mut self) -> Vec<Expr> {
@@ -2215,6 +2336,17 @@ fn infix_binding_power(token: &Token) -> Option<(u8, u8, InfixKind<'static>)> {
         TokenKind::Symbol(Symbol::Caret) => (18, 18, InfixKind::Binary("^")),
         _ => return None,
     })
+}
+
+fn finalize_chain(expr: Expr, segments: &mut Vec<ChainSegment>) -> Expr {
+    if segments.is_empty() {
+        expr
+    } else {
+        Expr::Chain {
+            base: Box::new(expr),
+            segments: std::mem::take(segments),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2606,5 +2738,16 @@ mod tests {
         assert!(lowered.contains("(function()"));
         assert!(lowered.contains("return \"none\""));
         assert!(lowered.contains("return \"many\""));
+    }
+
+    #[test]
+    fn preserves_phase_four_syntax_for_later_passes() {
+        let (lowered, diagnostics) = lower(
+            "function wrap<T extends string, U = {T}>(value: T): U\n    return value :: any\nend\nlocal boxed = wrap<number?>(nil)\n",
+        );
+
+        assert!(diagnostics.iter().all(|diagnostic| !diagnostic.is_error()));
+        assert!(lowered.contains("function wrap<T extends string, U = {T}>"));
+        assert!(lowered.contains("local boxed = wrap<number?>(nil)"));
     }
 }

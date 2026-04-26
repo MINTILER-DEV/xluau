@@ -95,6 +95,7 @@ pub enum Symbol {
     QuestionQuestion,
     QuestionQuestionEqual,
     Pipe,
+    Ampersand,
     PipeGreater,
     FatArrow,
     DotDot,
@@ -361,6 +362,7 @@ impl<'a> Lexer<'a> {
             '>' => TokenKind::Symbol(Symbol::Greater),
             '?' => TokenKind::Symbol(Symbol::Question),
             '|' => TokenKind::Symbol(Symbol::Pipe),
+            '&' => TokenKind::Symbol(Symbol::Ampersand),
             '@' => TokenKind::Symbol(Symbol::At),
             _ => {
                 diagnostics.push(Diagnostic::warning(

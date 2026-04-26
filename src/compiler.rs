@@ -13,6 +13,7 @@ use crate::formatter::Formatter;
 use crate::lexer::Lexer;
 use crate::lowering::Lowerer;
 use crate::parser::Parser;
+use crate::phase4::PhaseFourTransformer;
 use crate::resolver::Resolver;
 use crate::source::{SourceFile, SourceKind};
 
@@ -141,7 +142,42 @@ impl Compiler {
                     .map(|diagnostic| (diagnostic, lowered_source.text.clone())),
             );
 
-            let resolved_program = match resolver.resolve_program(&lowered_source, &lowered_program) {
+            let phase_four_text = PhaseFourTransformer::new(self.config.clone()).transform_program(
+                &lowered_source,
+                &lowered_program,
+                &mut diagnostics,
+            );
+
+            if diagnostics.iter().any(Diagnostic::is_error) {
+                all_diagnostics.extend(diagnostics);
+                continue;
+            }
+            warning_diagnostics.extend(
+                diagnostics
+                    .drain(..)
+                    .map(|diagnostic| (diagnostic, lowered_source.text.clone())),
+            );
+
+            let phase_four_source = SourceFile::virtual_file(
+                source.path.clone(),
+                SourceKind::Luau,
+                phase_four_text,
+            );
+            let phase_four_tokens = Lexer::new(&phase_four_source).lex(&mut diagnostics);
+            let phase_four_program =
+                Parser::new(&phase_four_source, &phase_four_tokens).parse(&mut diagnostics);
+
+            if diagnostics.iter().any(Diagnostic::is_error) {
+                all_diagnostics.extend(diagnostics);
+                continue;
+            }
+            warning_diagnostics.extend(
+                diagnostics
+                    .drain(..)
+                    .map(|diagnostic| (diagnostic, phase_four_source.text.clone())),
+            );
+
+            let resolved_program = match resolver.resolve_program(&phase_four_source, &phase_four_program) {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     all_diagnostics.push(Diagnostic::error(
@@ -158,7 +194,7 @@ impl Compiler {
 
             compiled.push(CompiledFile {
                 source,
-                _program: lowered_program,
+                _program: phase_four_program,
                 output,
             });
 

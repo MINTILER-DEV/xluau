@@ -911,6 +911,7 @@ fn symbol_text(symbol: Symbol) -> &'static str {
         Symbol::QuestionQuestion => "??",
         Symbol::QuestionQuestionEqual => "??=",
         Symbol::Pipe => "|",
+        Symbol::Ampersand => "&",
         Symbol::PipeGreater => "|>",
         Symbol::FatArrow => "=>",
         Symbol::DotDot => "..",
@@ -1263,6 +1264,38 @@ mod tests {
             }
             other => panic!("expected function node, found {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_keeps_statement_after_generic_function() {
+        let source = SourceFile {
+            path: PathBuf::from("test.xl"),
+            kind: SourceKind::XLuau,
+            text: "function wrap<T extends string, U = {T}>(value: T): U\n    return value\nend\nlocal boxed = wrap<number?>(nil)\n"
+                .to_owned(),
+        };
+        let tokens = Lexer::new(&source).lex(&mut Vec::new());
+        let program = Parser::new(&source, &tokens).parse(&mut Vec::new());
+
+        assert_eq!(program.statements.len(), 2);
+        assert!(matches!(program.statements[0].node, StatementNode::Function(_)));
+        assert!(matches!(program.statements[1].node, StatementNode::Local(_)));
+    }
+
+    #[test]
+    fn parser_keeps_statement_after_transformed_typed_call() {
+        let source = SourceFile {
+            path: PathBuf::from("test.luau"),
+            kind: SourceKind::Luau,
+            text: "function wrap(value: (T & string)): U\n    return value :: any\nend\nlocal boxed = wrap((nil :: number?))\n"
+                .to_owned(),
+        };
+        let tokens = Lexer::new(&source).lex(&mut Vec::new());
+        let program = Parser::new(&source, &tokens).parse(&mut Vec::new());
+
+        assert_eq!(program.statements.len(), 2);
+        assert!(matches!(program.statements[0].node, StatementNode::Function(_)));
+        assert!(matches!(program.statements[1].node, StatementNode::Local(_)));
     }
 
     #[test]

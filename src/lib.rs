@@ -8,6 +8,7 @@ mod formatter;
 mod lexer;
 mod lowering;
 mod parser;
+mod phase4;
 mod resolver;
 mod source;
 
